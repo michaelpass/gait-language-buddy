@@ -71,6 +71,7 @@ SUPPORTED_LANGUAGES = [
     "Spanish",
     "French",
     "German",
+    "Arabic",
     "Japanese",
     "Chinese",
     # English intentionally omitted (UI is in English)
