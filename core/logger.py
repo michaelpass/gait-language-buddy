@@ -21,6 +21,15 @@ import sys
 from datetime import datetime
 from typing import Optional
 
+# ---------------------------------------------------------------------------
+# Force UTF-8 output on Windows (Python 3.7+)
+# Prevents UnicodeEncodeError when printing Unicode characters (✓, ✗, ⠋, etc.)
+# ---------------------------------------------------------------------------
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 
 class ColorCodes:
     """ANSI color codes for terminal output."""
