@@ -24,14 +24,26 @@ Then run:
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
+import os
 
 from typing import Optional, List, Dict, Any, Set
 
 from PIL import Image, ImageTk
 
+# Audio playback support
+try:
+    import pygame
+    pygame.mixer.init()
+    AUDIO_AVAILABLE = True
+except ImportError:
+    AUDIO_AVAILABLE = False
+    print("Note: pygame not installed. Audio playback will be disabled.")
+    print("Install with: pip install pygame")
+
 from core.logger import logger
 from core.api import (
     SUPPORTED_LANGUAGES,
+    is_api_available,  # Check if API key is loaded
     generate_assessment_cards,
     evaluate_assessment_responses,
     generate_structured_lesson_plan,
@@ -40,6 +52,7 @@ from core.api import (
     generate_final_summary,
     generate_image_async,
     generate_images_parallel,  # Parallel image generation
+    generate_speech_async,  # TTS generation
 )
 from core.models import (
     AssessmentCard, AssessmentResult, LessonPlan, LessonCard
@@ -56,6 +69,8 @@ logger.banner("GAIT Language Buddy - Starting Application")
 class ScrollableFrame(ttk.Frame):
     """
     A frame that provides vertical scrolling for its content.
+    Scrollbar auto-hides when content fits within the viewport.
+    Content is centered both horizontally and vertically when it fits.
     
     Usage:
         scrollable = ScrollableFrame(parent)
@@ -67,6 +82,10 @@ class ScrollableFrame(ttk.Frame):
     
     def __init__(self, parent, **kwargs) -> None:
         super().__init__(parent, **kwargs)
+        
+        # Track scrollbar visibility and layout state
+        self._scrollbar_visible = False
+        self._last_canvas_height = 0
         
         # Create canvas and scrollbar
         self.canvas = tk.Canvas(
@@ -80,38 +99,124 @@ class ScrollableFrame(ttk.Frame):
             command=self.canvas.yview,
         )
         
-        # Create the content frame inside canvas
-        self.content = ttk.Frame(self.canvas)
+        # Create an outer frame for vertical centering
+        self._outer_frame = ttk.Frame(self.canvas)
         
-        # Create window in canvas for content frame
+        # Create the content frame inside the outer frame
+        self.content = ttk.Frame(self._outer_frame)
+        self.content.pack(expand=True)
+        
+        # Create window in canvas for outer frame
         self.content_window = self.canvas.create_window(
             (0, 0),
-            window=self.content,
+            window=self._outer_frame,
             anchor="nw",
         )
         
         # Configure scrollbar
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.configure(yscrollcommand=self._on_scroll_set)
         
-        # Layout
+        # Layout - canvas fills space, scrollbar hidden initially
         self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
+        # Don't pack scrollbar initially - it will show when needed
         
         # Bind events
         self.content.bind("<Configure>", self._on_content_configure)
+        self._outer_frame.bind("<Configure>", self._on_outer_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         
         # Bind mousewheel scrolling
         self._bind_mousewheel()
     
+    def _on_scroll_set(self, first: str, last: str) -> None:
+        """Handle scrollbar position updates - show/hide scrollbar dynamically."""
+        first_f = float(first)
+        last_f = float(last)
+        
+        # If the entire content is visible (first=0.0 and last=1.0), hide scrollbar
+        needs_scrollbar = not (first_f <= 0.0 and last_f >= 1.0)
+        
+        if needs_scrollbar and not self._scrollbar_visible:
+            self.scrollbar.pack(side="right", fill="y")
+            self._scrollbar_visible = True
+        elif not needs_scrollbar and self._scrollbar_visible:
+            self.scrollbar.pack_forget()
+            self._scrollbar_visible = False
+        
+        # Update scrollbar position
+        self.scrollbar.set(first, last)
+    
     def _on_content_configure(self, event: tk.Event) -> None:
-        """Update scroll region when content changes."""
+        """Update layout when content changes."""
+        self.after_idle(self._update_layout)
+    
+    def _on_outer_configure(self, event: tk.Event) -> None:
+        """Update scroll region when outer frame changes."""
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
     
     def _on_canvas_configure(self, event: tk.Event) -> None:
-        """Resize content width to match canvas width."""
-        # Make content fill canvas width
-        self.canvas.itemconfigure(self.content_window, width=event.width)
+        """Update layout when canvas is resized."""
+        self._update_layout()
+    
+    def _update_layout(self) -> None:
+        """Update content position and scroll region for proper centering."""
+        try:
+            canvas_width = self.canvas.winfo_width()
+            canvas_height = self.canvas.winfo_height()
+            
+            if canvas_width <= 1 or canvas_height <= 1:
+                return
+            
+            # Get content dimensions
+            self.content.update_idletasks()
+            content_height = self.content.winfo_reqheight()
+            
+            # Determine if scrolling is needed
+            needs_scrolling = content_height > canvas_height
+            
+            # Set outer frame dimensions
+            # Width always matches canvas for horizontal centering of children
+            # Height depends on whether we need scrolling
+            if needs_scrolling:
+                # Content overflows - outer frame matches content height
+                outer_height = content_height
+            else:
+                # Content fits - outer frame matches canvas for vertical centering
+                outer_height = canvas_height
+            
+            # Update the canvas window size
+            self.canvas.itemconfigure(
+                self.content_window, 
+                width=canvas_width,
+                height=outer_height
+            )
+            
+            # Update scroll region
+            self.canvas.configure(scrollregion=(0, 0, canvas_width, outer_height))
+            
+            # Check scrollbar visibility
+            self._check_scrollbar_visibility()
+            
+        except Exception:
+            pass
+    
+    def _check_scrollbar_visibility(self) -> None:
+        """Check if scrollbar should be visible based on content vs canvas size."""
+        try:
+            canvas_height = self.canvas.winfo_height()
+            self.content.update_idletasks()
+            content_height = self.content.winfo_reqheight()
+            
+            needs_scrollbar = content_height > canvas_height
+            
+            if needs_scrollbar and not self._scrollbar_visible:
+                self.scrollbar.pack(side="right", fill="y")
+                self._scrollbar_visible = True
+            elif not needs_scrollbar and self._scrollbar_visible:
+                self.scrollbar.pack_forget()
+                self._scrollbar_visible = False
+        except Exception:
+            pass
     
     def _bind_mousewheel(self) -> None:
         """Bind mousewheel events for scrolling."""
@@ -135,6 +240,9 @@ class ScrollableFrame(ttk.Frame):
     
     def _on_mousewheel(self, event: tk.Event) -> None:
         """Handle mousewheel on Windows/macOS."""
+        # Only scroll if scrollbar is visible (content overflows)
+        if not self._scrollbar_visible:
+            return
         # event.delta is positive for scroll up, negative for scroll down
         # Windows: delta is typically 120 or -120
         # macOS: delta can be smaller values
@@ -143,14 +251,162 @@ class ScrollableFrame(ttk.Frame):
     
     def _on_mousewheel_linux(self, event: tk.Event) -> None:
         """Handle mousewheel on Linux."""
+        # Only scroll if scrollbar is visible (content overflows)
+        if not self._scrollbar_visible:
+            return
         if event.num == 4:
             self.canvas.yview_scroll(-1, "units")
         elif event.num == 5:
             self.canvas.yview_scroll(1, "units")
     
     def scroll_to_top(self) -> None:
-        """Scroll content to top."""
+        """Scroll content to top and re-center."""
         self.canvas.yview_moveto(0)
+        # Re-center content after scrolling
+        self.after_idle(self._update_layout)
+
+
+# ---------------------------------------------------------------------------
+# Responsive Image Widget (resizes with window)
+# ---------------------------------------------------------------------------
+
+class ResponsiveImage(ttk.Frame):
+    """
+    An image widget that resizes dynamically with the window.
+    Targets approximately 1/3 of window height while maintaining aspect ratio.
+    """
+    
+    # Minimum dimensions to ensure visibility
+    MIN_WIDTH = 150
+    MIN_HEIGHT = 100
+    # Maximum dimensions to prevent excessive size
+    MAX_WIDTH = 800
+    MAX_HEIGHT = 600
+    # Target fraction of window height
+    TARGET_HEIGHT_FRACTION = 0.33
+    
+    def __init__(self, parent, **kwargs) -> None:
+        super().__init__(parent, **kwargs)
+        
+        self._original_image: Optional[Image.Image] = None
+        self._image_path: Optional[str] = None
+        self._photo: Optional[ImageTk.PhotoImage] = None
+        self._last_window_height: int = 0
+        
+        # Label to display the image
+        self.image_label = ttk.Label(self)
+        self.image_label.pack(fill="both", expand=True)
+        
+        # Bind resize event to self and schedule binding to root window
+        self.bind("<Configure>", self._on_resize)
+        self.after(100, self._bind_to_root_window)
+    
+    def _bind_to_root_window(self) -> None:
+        """Bind to root window configure event to catch window resizes."""
+        root = self._get_root_window()
+        if root:
+            root.bind("<Configure>", self._on_window_resize, add="+")
+    
+    def _get_root_window(self) -> Optional[tk.Tk]:
+        """Get the root Tk window."""
+        widget = self
+        while widget.master:
+            widget = widget.master
+        return widget if isinstance(widget, tk.Tk) else None
+    
+    def set_image(self, image_path: str) -> bool:
+        """
+        Load and display an image from the given path.
+        Returns True if successful, False otherwise.
+        """
+        try:
+            self._image_path = image_path
+            self._original_image = Image.open(image_path)
+            self._update_display()
+            return True
+        except Exception:
+            self._original_image = None
+            self._image_path = None
+            self.image_label.configure(text="[Could not display image]", image="")
+            return False
+    
+    def clear_image(self) -> None:
+        """Clear the current image."""
+        self._original_image = None
+        self._image_path = None
+        self._photo = None
+        self.image_label.configure(text="", image="")
+    
+    def set_placeholder(self, text: str = "Loading image...") -> None:
+        """Show placeholder text instead of image."""
+        self._original_image = None
+        self._photo = None
+        self.image_label.configure(text=text, image="")
+    
+    def _on_resize(self, event: tk.Event) -> None:
+        """Handle widget resize - update image to fit new size."""
+        if self._original_image:
+            self._check_and_update()
+    
+    def _on_window_resize(self, event: tk.Event) -> None:
+        """Handle window resize - update image if visible."""
+        if self._original_image and self.winfo_viewable():
+            self._check_and_update()
+    
+    def _check_and_update(self) -> None:
+        """Check if window height changed significantly and update if needed."""
+        root = self._get_root_window()
+        if root:
+            window_height = root.winfo_height()
+            # Only redraw if window height changed by more than 20px
+            if abs(window_height - self._last_window_height) > 20:
+                self._last_window_height = window_height
+                self._update_display()
+    
+    def _update_display(self) -> None:
+        """Update the displayed image to fit ~1/3 of window height."""
+        if not self._original_image:
+            return
+        
+        # Get window dimensions
+        root = self._get_root_window()
+        if root:
+            window_height = root.winfo_height()
+            window_width = root.winfo_width()
+        else:
+            window_height = 750  # Default fallback
+            window_width = 850
+        
+        # Target height is 1/3 of window height
+        target_height = int(window_height * self.TARGET_HEIGHT_FRACTION)
+        # Target width based on available space (with padding)
+        target_width = int(window_width * 0.7)
+        
+        # Apply min/max constraints
+        target_height = max(self.MIN_HEIGHT, min(target_height, self.MAX_HEIGHT))
+        target_width = max(self.MIN_WIDTH, min(target_width, self.MAX_WIDTH))
+        
+        # Calculate size maintaining aspect ratio
+        orig_width, orig_height = self._original_image.size
+        
+        # Scale to fit within target dimensions
+        width_ratio = target_width / orig_width
+        height_ratio = target_height / orig_height
+        ratio = min(width_ratio, height_ratio)
+        
+        new_width = max(self.MIN_WIDTH, int(orig_width * ratio))
+        new_height = max(self.MIN_HEIGHT, int(orig_height * ratio))
+        
+        # Resize image using high-quality resampling
+        resized = self._original_image.copy()
+        resized.thumbnail((new_width, new_height), Image.Resampling.LANCZOS)
+        
+        # Create PhotoImage and update label
+        self._photo = ImageTk.PhotoImage(resized)
+        self.image_label.configure(image=self._photo, text="")
+        
+        # Store current window height for change detection
+        self._last_window_height = window_height
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +464,176 @@ class LoadingSpinner(ttk.Frame):
         self.spinner_index = (self.spinner_index + 1) % len(self.spinner_chars)
         
         self._after_id = self.after(100, self._animate)  # Update every 100ms
+
+
+# ---------------------------------------------------------------------------
+# Audio Player Widget
+# ---------------------------------------------------------------------------
+
+class AudioPlayer(ttk.Frame):
+    """
+    A widget for playing audio files with a single play/pause button.
+    Uses pygame for cross-platform audio playback.
+    """
+    
+    def __init__(self, parent, **kwargs) -> None:
+        super().__init__(parent, **kwargs)
+        
+        self._audio_path: Optional[str] = None
+        self._is_playing: bool = False
+        self._is_loaded: bool = False
+        self._playback_finished: bool = False
+        
+        # Create control frame
+        self.control_frame = ttk.Frame(self)
+        self.control_frame.pack(pady=10)
+        
+        # Single play/pause/replay button
+        self.play_button = ttk.Button(
+            self.control_frame,
+            text="▶ Play Audio",
+            command=self._on_play_click,
+            width=18,
+        )
+        self.play_button.pack(padx=5)
+        
+        # Status label
+        self.status_label = ttk.Label(
+            self,
+            text="",
+            font=("Helvetica", 11),
+            foreground="#7bb3ff",
+            anchor="center",
+        )
+        self.status_label.pack(pady=(5, 0))
+        
+        # Loading indicator
+        self.loading_label = ttk.Label(
+            self,
+            text="⏳ Generating audio...",
+            font=("Helvetica", 12),
+            foreground="#7bb3ff",
+            anchor="center",
+        )
+        self.loading_label.pack(pady=10)
+        
+        # Initially show loading, hide controls
+        self._show_loading()
+    
+    def _show_loading(self) -> None:
+        """Show loading state."""
+        self.loading_label.pack(pady=10)
+        self.control_frame.pack_forget()
+        self.status_label.pack_forget()
+    
+    def _show_controls(self) -> None:
+        """Show playback controls."""
+        self.loading_label.pack_forget()
+        self.control_frame.pack(pady=10)
+        self.status_label.pack(pady=(5, 0))
+    
+    def set_audio(self, audio_path: str) -> bool:
+        """
+        Load an audio file for playback.
+        Returns True if successful.
+        """
+        if not AUDIO_AVAILABLE:
+            self.status_label.configure(text="Audio playback not available")
+            self._show_controls()
+            return False
+        
+        if not audio_path or not os.path.exists(audio_path):
+            self.status_label.configure(text="Audio file not found")
+            self._show_controls()
+            return False
+        
+        try:
+            self._audio_path = audio_path
+            pygame.mixer.music.load(audio_path)
+            self._is_loaded = True
+            self._is_playing = False
+            self._playback_finished = False
+            self.play_button.configure(text="▶ Play Audio")
+            self.status_label.configure(text="Click to listen")
+            self._show_controls()
+            logger.ui(f"Audio loaded: {audio_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load audio: {e}")
+            self.status_label.configure(text="Failed to load audio")
+            self._show_controls()
+            return False
+    
+    def set_loading(self, message: str = "Generating audio...") -> None:
+        """Show loading state with custom message."""
+        self.loading_label.configure(text=f"⏳ {message}")
+        self._show_loading()
+    
+    def _on_play_click(self) -> None:
+        """Handle play/pause/replay button click."""
+        if not AUDIO_AVAILABLE or not self._is_loaded:
+            return
+        
+        if self._is_playing:
+            # Pause
+            pygame.mixer.music.pause()
+            self._is_playing = False
+            self.play_button.configure(text="▶ Resume")
+            self.status_label.configure(text="Paused")
+        elif self._playback_finished:
+            # Replay from beginning
+            pygame.mixer.music.play()
+            self._is_playing = True
+            self._playback_finished = False
+            self.play_button.configure(text="⏸ Pause")
+            self.status_label.configure(text="Playing...")
+            self._check_playback_status()
+        else:
+            # Play or unpause
+            if pygame.mixer.music.get_pos() == -1:
+                # Not started yet, play from beginning
+                pygame.mixer.music.play()
+            else:
+                # Was paused, unpause
+                pygame.mixer.music.unpause()
+            self._is_playing = True
+            self.play_button.configure(text="⏸ Pause")
+            self.status_label.configure(text="Playing...")
+            
+            # Schedule check for when playback ends
+            self._check_playback_status()
+    
+    def _check_playback_status(self) -> None:
+        """Check if audio is still playing and update UI."""
+        if not self._is_playing:
+            return
+        
+        if not pygame.mixer.music.get_busy():
+            # Playback finished
+            self._is_playing = False
+            self._playback_finished = True
+            self.play_button.configure(text="▶ Play Again")
+            self.status_label.configure(text="Finished - click to replay")
+        else:
+            # Still playing, check again later
+            self.after(200, self._check_playback_status)
+    
+    def stop(self) -> None:
+        """Stop playback."""
+        if AUDIO_AVAILABLE and self._is_loaded:
+            pygame.mixer.music.stop()
+            self._is_playing = False
+    
+    def cleanup(self) -> None:
+        """Clean up resources."""
+        self.stop()
+        if self._audio_path and os.path.exists(self._audio_path):
+            try:
+                # Unload the music first
+                if AUDIO_AVAILABLE:
+                    pygame.mixer.music.unload()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -697,7 +1123,7 @@ class IntroCard(ttk.Frame):
             anchor="center",
             foreground="#ffffff",  # White text on dark background
         )
-        title.grid(row=0, column=0, pady=(40, 20), padx=20, sticky="ew")
+        title.grid(row=0, column=0, pady=(40, 20), padx=20)
 
         desc_text = (
             "Welcome! This tool helps you learn and practice another language with personalized lessons.\n\n"
@@ -712,11 +1138,12 @@ class IntroCard(ttk.Frame):
             self.content, 
             text=desc_text, 
             wraplength=650, 
-            justify="left",
+            justify="center",
+            anchor="center",
             font=("Helvetica", 14),
             foreground="#d0d0d0",  # Light gray text on dark background
         )
-        desc.grid(row=1, column=0, padx=40, pady=(0, 30), sticky="ew")
+        desc.grid(row=1, column=0, padx=40, pady=(0, 30))
         self.desc_label = desc
 
         lang_frame = ttk.Frame(self.content)
@@ -749,22 +1176,48 @@ class IntroCard(ttk.Frame):
             arrowcolor='#ffffff',
         )
 
-        start_button = ttk.Button(
+        # API key warning (shown only if API isn't available)
+        self.api_warning_label = ttk.Label(
             self.content,
-            text="Start Session",
-            command=self._on_start_clicked,
+            text="⚠ OpenAI API key not found!\n\nPlease add your API key to a .env file:\nOPENAI_API_KEY=sk-...\n\nThe application cannot function without a valid API key.",
+            font=("Helvetica", 13),
+            foreground="#ff6b6b",  # Red warning color
+            justify="center",
+            anchor="center",
+            wraplength=500,
         )
-        start_button.grid(row=3, column=0, pady=(20, 50))
+        self.api_warning_label.grid(row=3, column=0, pady=(10, 10))
+        
+        # Check API availability and show/hide warning
+        self.api_available = is_api_available()
+        if self.api_available:
+            self.api_warning_label.grid_remove()
+        
+        self.start_button = ttk.Button(
+            self.content,
+            text="Start Session" if self.api_available else "API Key Required",
+            command=self._on_start_clicked,
+            state="normal" if self.api_available else "disabled",
+        )
+        self.start_button.grid(row=4, column=0, pady=(20, 50))
         
         # Style the button to be more prominent
         style = ttk.Style()
         style.configure("Start.TButton", font=("Helvetica", 14, "bold"), padding=10)
-        start_button.configure(style="Start.TButton")
+        self.start_button.configure(style="Start.TButton")
 
         # Responsive wrapping - bind to scrollable canvas for width changes
         self.scrollable.canvas.bind("<Configure>", self._on_content_resize)
 
     def _on_start_clicked(self) -> None:
+        # Double-check API availability
+        if not is_api_available():
+            messagebox.showerror(
+                "API Key Required", 
+                "OpenAI API key not found.\n\nPlease add your API key to a .env file:\nOPENAI_API_KEY=sk-..."
+            )
+            return
+        
         language = self.language_var.get()
         if not language:
             messagebox.showinfo("Choose a language", "Please select a target language to continue.")
@@ -812,12 +1265,13 @@ class AssessmentCardView(ttk.Frame):
             anchor="center",
             foreground="#ffffff",  # White text on dark background
         )
-        self.title_label.grid(row=0, column=0, pady=(30, 15), sticky="ew")
+        self.title_label.grid(row=0, column=0, pady=(30, 15))
 
         self.stage_label = ttk.Label(
             self.content,
             text="Stage 1 of 3",
             font=("Helvetica", 14),
+            anchor="center",
             foreground="#7bb3ff",  # Light blue text on dark background
         )
         self.stage_label.grid(row=1, column=0, pady=(0, 10))
@@ -829,44 +1283,47 @@ class AssessmentCardView(ttk.Frame):
         self.pending_instruction_text: str = ""
         self.waiting_for_image: bool = False
 
-        # Instruction label (left-justified)
+        # Instruction label (centered)
         self.instruction_label = ttk.Label(
             self.content,
             text="",
             wraplength=600,
-            justify="left",
+            justify="center",
+            anchor="center",
             font=("Helvetica", 14),
             foreground="#7bb3ff",  # Light blue text on dark background
         )
-        self.instruction_label.grid(row=3, column=0, padx=30, pady=(0, 10), sticky="ew")
+        self.instruction_label.grid(row=3, column=0, padx=30, pady=(0, 10))
 
         # Image loading status labels
         self.image_status_label = ttk.Label(
             self.content,
             text="",
             wraplength=600,
-            justify="left",
+            justify="center",
+            anchor="center",
             font=("Helvetica", 13),
             foreground="#7bb3ff",
         )
-        self.image_status_label.grid(row=4, column=0, padx=30, sticky="ew")
+        self.image_status_label.grid(row=4, column=0, padx=30)
         self.image_status_label.grid_remove()
 
         self.image_status_detail_label = ttk.Label(
             self.content,
             text="",
             wraplength=600,
-            justify="left",
+            justify="center",
+            anchor="center",
             font=("Helvetica", 12, "italic"),
             foreground="#9bc6ff",
         )
-        self.image_status_detail_label.grid(row=5, column=0, padx=30, pady=(0, 10), sticky="ew")
+        self.image_status_detail_label.grid(row=5, column=0, padx=30, pady=(0, 10))
         self.image_status_detail_label.grid_remove()
 
-        # Image area (for image-based questions)
-        self.image_label = ttk.Label(self.content)
-        self.image_label.grid(row=6, column=0, padx=20, pady=(0, 10))
-        self.image_label.grid_remove()
+        # Image area (for image-based questions) - responsive sizing
+        self.responsive_image = ResponsiveImage(self.content)
+        self.responsive_image.grid(row=6, column=0, padx=20, pady=(0, 10))
+        self.responsive_image.grid_remove()
 
         # Question label
         self.question_label = ttk.Label(
@@ -875,13 +1332,14 @@ class AssessmentCardView(ttk.Frame):
             font=("Helvetica", 24, "bold"),
             wraplength=600,
             justify="center",
+            anchor="center",
             foreground="#ffffff",  # White text on dark background
         )
-        self.question_label.grid(row=7, column=0, padx=30, pady=(15, 8), sticky="ew")
+        self.question_label.grid(row=7, column=0, padx=30, pady=(15, 8))
 
         # Answer area (dynamic based on card type)
         self.answer_frame = ttk.Frame(self.content)
-        self.answer_frame.grid(row=8, column=0, padx=30, pady=(0, 15), sticky="nsew")
+        self.answer_frame.grid(row=8, column=0, padx=30, pady=(0, 15))
         
         # Text input (for text questions)
         self.text_widget: Optional[tk.Text] = None
@@ -939,7 +1397,7 @@ class AssessmentCardView(ttk.Frame):
         self.instruction_label.grid_remove()
         self.image_status_label.grid_remove()
         self.image_status_detail_label.grid_remove()
-        self.image_label.grid_remove()
+        self.responsive_image.grid_remove()
         self.question_label.grid_remove()
         self.answer_frame.grid_remove()
         self.submit_button.grid_remove()
@@ -1000,7 +1458,7 @@ class AssessmentCardView(ttk.Frame):
                 self.waiting_for_image = True
                 self._set_instruction_text("Loading image for this question...")
                 self._show_image_status("Loading image...", "This may take a few seconds.")
-                self.image_label.grid_remove()
+                self.responsive_image.grid_remove()
                 # Hide Q&A until image arrives so the user doesn't answer blind
                 self.question_label.grid_remove()
                 self.answer_frame.grid_remove()
@@ -1008,7 +1466,7 @@ class AssessmentCardView(ttk.Frame):
                 self.controller.request_assessment_image(card.image_prompt)
         else:
             self.waiting_for_image = False
-            self.image_label.grid_remove()
+            self.responsive_image.grid_remove()
 
         # Scroll to top when showing new stage
         self.scrollable.scroll_to_top()
@@ -1017,13 +1475,12 @@ class AssessmentCardView(ttk.Frame):
     def _render_text_input(self) -> None:
         """Render text input area."""
         text_frame = ttk.Frame(self.answer_frame)
-        text_frame.grid(row=0, column=0, sticky="nsew")
-        self.answer_frame.rowconfigure(0, weight=1)
-        self.answer_frame.columnconfigure(0, weight=1)
+        text_frame.grid(row=0, column=0)
         
         self.text_widget = tk.Text(
             text_frame, 
-            height=8, 
+            height=8,
+            width=60,  # Fixed width for consistent centering
             wrap="word",
             bg="#2d2d2d",  # Dark background
             fg="#e0e0e0",  # Light text
@@ -1031,9 +1488,7 @@ class AssessmentCardView(ttk.Frame):
             selectbackground="#3d3d3d",  # Dark selection background
             selectforeground="#ffffff",  # White selected text
         )
-        self.text_widget.grid(row=0, column=0, sticky="nsew", pady=(5, 0))
-        text_frame.rowconfigure(0, weight=1)
-        text_frame.columnconfigure(0, weight=1)
+        self.text_widget.grid(row=0, column=0, pady=(5, 0))
         
         self.text_scrollbar = ttk.Scrollbar(
             text_frame,
@@ -1055,18 +1510,8 @@ class AssessmentCardView(ttk.Frame):
 
     def _display_image(self, image_path: str) -> None:
         """Display an image from path and restore normal layout."""
-        try:
-            img = Image.open(image_path)
-            img.thumbnail((600, 400))
-            photo = ImageTk.PhotoImage(img)
-            # Keep reference to prevent GC
-            self.controller.current_photo = photo
-            self.image_label.configure(image=photo, text="")
-            self.image_label.grid()
-
-        except Exception:
-            self.image_label.configure(text="[Could not display image]", image="")
-            self.image_label.grid()
+        success = self.responsive_image.set_image(image_path)
+        self.responsive_image.grid()
 
         # Once the image is ready, restore the normal instruction + Q&A
         self._set_instruction_text(self.pending_instruction_text or "Please answer the following question.")
@@ -1136,6 +1581,7 @@ class LessonCardView(ttk.Frame):
             self.content,
             text="Lesson Prompts",
             font=("Helvetica", 24, "bold"),
+            anchor="center",
         )
         self.title_label.grid(row=0, column=0, pady=(20, 10))
 
@@ -1143,11 +1589,12 @@ class LessonCardView(ttk.Frame):
             self.content,
             text="Work through the prompts one by one.",
             wraplength=600,
-            justify="left",
+            justify="center",
+            anchor="center",
             font=("Helvetica", 14),
             foreground="#d0d0d0",  # Light gray text on dark background
         )
-        self.subtitle_label.grid(row=1, column=0, padx=30, pady=(0, 15), sticky="ew")
+        self.subtitle_label.grid(row=1, column=0, padx=30, pady=(0, 15))
 
         # Loading spinner
         self.loading_spinner = LoadingSpinner(self.content, text="Evaluating and generating lesson...")
@@ -1156,14 +1603,15 @@ class LessonCardView(ttk.Frame):
         self.progress_label = ttk.Label(
             self.content, 
             text="",
+            anchor="center",
             foreground="#7bb3ff",  # Light blue text on dark background
         )
         self.progress_label.grid(row=2, column=0, pady=(0, 10))
         
-        # Image area (for image-based questions)
-        self.image_label = ttk.Label(self.content)
-        self.image_label.grid(row=3, column=0, padx=20, pady=(0, 10))
-        self.image_label.grid_remove()
+        # Image area (for image-based questions) - responsive sizing
+        self.responsive_image = ResponsiveImage(self.content)
+        self.responsive_image.grid(row=3, column=0, padx=20, pady=(0, 10))
+        self.responsive_image.grid_remove()
         
         # Question label
         self.question_label = ttk.Label(
@@ -1172,13 +1620,14 @@ class LessonCardView(ttk.Frame):
             font=("Helvetica", 24, "bold"),
             wraplength=600,
             justify="center",
+            anchor="center",
             foreground="#ffffff",  # White text on dark background
         )
-        self.question_label.grid(row=4, column=0, padx=30, pady=(15, 8), sticky="ew")
+        self.question_label.grid(row=4, column=0, padx=30, pady=(15, 8))
         
         # Answer area (dynamic based on card type)
         self.answer_frame = ttk.Frame(self.content)
-        self.answer_frame.grid(row=5, column=0, padx=20, pady=(10, 10), sticky="nsew")
+        self.answer_frame.grid(row=5, column=0, padx=20, pady=(10, 10))
         
         # Multiple choice buttons (will be created dynamically)
         self.mc_buttons: List[ttk.Button] = []
@@ -1187,6 +1636,10 @@ class LessonCardView(ttk.Frame):
         # Text input (for text questions)
         self.text_widget: Optional[tk.Text] = None
         self.text_scrollbar: Optional[ttk.Scrollbar] = None
+        
+        # Audio player (for audio questions)
+        self.audio_player: Optional[AudioPlayer] = None
+        self.current_audio_path: Optional[str] = None
 
         self.next_button = ttk.Button(
             self.content, text="Submit Answer", command=self._on_next_clicked
@@ -1194,53 +1647,51 @@ class LessonCardView(ttk.Frame):
         self.next_button.grid(row=6, column=0, pady=(10, 20))
         self.submit_button = self.next_button
 
-        # Feedback card (full-width)
+        # Feedback card
         self.feedback_card = ttk.Frame(self.content)
-        self.feedback_card.grid(row=7, column=0, padx=20, pady=(5, 40), sticky="nsew")
-        self.feedback_card.columnconfigure(0, weight=1)
+        self.feedback_card.grid(row=7, column=0, padx=20, pady=(5, 40))
         self.feedback_card.grid_remove()
 
         self.feedback_title = ttk.Label(
             self.feedback_card,
             text="Feedback",
             font=("Helvetica", 20, "bold"),
-            justify="left",
-            anchor="w",
+            justify="center",
+            anchor="center",
         )
-        self.feedback_title.grid(row=0, column=0, pady=(4, 6), sticky="ew")
+        self.feedback_title.grid(row=0, column=0, pady=(4, 6))
 
         # Simplified feedback body (no nested canvas - outer ScrollableFrame handles scrolling)
         self.feedback_body = ttk.Frame(self.feedback_card)
-        self.feedback_body.grid(row=1, column=0, sticky="nsew")
-        self.feedback_body.columnconfigure(0, weight=1)
+        self.feedback_body.grid(row=1, column=0)
 
         self.feedback_label = ttk.Label(
             self.feedback_body,
             text="",
             wraplength=600,
-            justify="left",
-            anchor="w",
+            justify="center",
+            anchor="center",
             foreground="#d0d0d0",
         )
-        self.feedback_label.grid(row=0, column=0, pady=(0, 8), sticky="ew")
+        self.feedback_label.grid(row=0, column=0, pady=(0, 8))
 
         self.vocab_expansion_label = ttk.Label(
             self.feedback_body,
             text="",
             wraplength=600,
-            justify="left",
-            anchor="w",
+            justify="center",
+            anchor="center",
             font=("Helvetica", 14, "bold"),
             foreground="#7bb3ff",
         )
-        self.vocab_expansion_label.grid(row=1, column=0, pady=(0, 6), sticky="ew")
+        self.vocab_expansion_label.grid(row=1, column=0, pady=(0, 6))
 
         self.continue_button = ttk.Button(
             self.feedback_card,
             text="Continue",
             command=self._on_continue_after_feedback,
         )
-        self.continue_button.grid(row=2, column=0, pady=(10, 5), sticky="e")
+        self.continue_button.grid(row=2, column=0, pady=(10, 5))
 
         self.feedback_spinner = LoadingSpinner(
             self.content, text="Evaluating your answer..."
@@ -1268,7 +1719,7 @@ class LessonCardView(ttk.Frame):
         self.loading_spinner.label.configure(text=f"{self.loading_spinner.spinner_chars[0]} {message}")
         self.loading_spinner.start()
         self.progress_label.grid_remove()
-        self.image_label.grid_remove()
+        self.responsive_image.grid_remove()
         self.question_label.grid_remove()
         self.answer_frame.grid_remove()
         self.next_button.grid_remove()
@@ -1341,16 +1792,18 @@ class LessonCardView(ttk.Frame):
                 self._display_image(image_path)
             else:
                 # Simple text placeholder while image loads
-                self.image_label.configure(text="Loading image...", image="")
-                self.image_label.grid()
+                self.responsive_image.set_placeholder("Loading image...")
+                self.responsive_image.grid()
         else:
-            self.image_label.grid_remove() 
+            self.responsive_image.grid_remove() 
 
         # Render answer area based on card type
         if card.type == "multiple_choice":
             self._render_multiple_choice(card)
         elif card.type == "vocabulary":
             self._render_vocabulary(card)
+        elif card.type in ("audio_transcription", "audio_comprehension"):
+            self._render_audio_card(card)
         else:
             self._render_text_input(card)
     
@@ -1377,11 +1830,11 @@ class LessonCardView(ttk.Frame):
                 self.answer_frame,
                 text=f"{chr(65+i)}. {option}",  # A, B, C, D
                 command=lambda idx=i: self._on_mc_selected(idx),
+                width=50,  # Fixed width for consistent centering
             )
-            btn.grid(row=i, column=0, sticky="ew", pady=(4, 4), padx=20)
+            btn.grid(row=i, column=0, pady=(4, 4), padx=20)
             self.mc_buttons.append(btn)
         self.answer_frame.grid()
-        self.answer_frame.columnconfigure(0, weight=1)
 
     def _set_instruction_text(self, text: str) -> None:
         self.instruction_label.configure(text=text)
@@ -1409,11 +1862,95 @@ class LessonCardView(ttk.Frame):
         if card.related_words:
             vocab_text += f"Related words: {', '.join(card.related_words)}"
         
-        if not hasattr(self, 'vocab_label'):
-            self.vocab_label = ttk.Label(self.answer_frame, text="", wraplength=600, justify="center")
+        if not hasattr(self, 'vocab_label') or not self.vocab_label:
+            self.vocab_label = ttk.Label(self.answer_frame, text="", wraplength=600, justify="center", anchor="center")
             self.vocab_label.grid(row=0, column=0, padx=20, pady=10)
         self.vocab_label.configure(text=vocab_text)
         self.answer_frame.grid()
+    
+    def _render_audio_card(self, card: LessonCard) -> None:
+        """Render audio transcription or comprehension card."""
+        # Clear multiple choice buttons if they exist
+        if hasattr(self, 'mc_buttons'):
+            for btn in self.mc_buttons:
+                btn.destroy()
+            self.mc_buttons = []
+        
+        # Hide image area for audio cards
+        self.responsive_image.grid_remove()
+        
+        # Create or update audio player - place it in content frame (row 3, where image normally goes)
+        if not self.audio_player:
+            self.audio_player = AudioPlayer(self.content)
+        
+        # Place audio player in the content area (between progress label and question)
+        self.audio_player.grid(row=3, column=0, pady=(10, 10))
+        
+        # Check if we already have audio for this card
+        if card.audio_path and os.path.exists(card.audio_path):
+            # Audio already generated
+            self.audio_player.set_audio(card.audio_path)
+        else:
+            # Need to generate audio
+            self.audio_player.set_loading("Generating audio...")
+            self._generate_audio_for_card(card)
+        
+        # Create text input for transcription/answer in answer_frame
+        if not hasattr(self, 'text_widget') or not self.text_widget:
+            text_frame = ttk.Frame(self.answer_frame)
+            text_frame.grid(row=0, column=0, pady=(10, 0))
+            
+            self.text_widget = tk.Text(
+                text_frame, 
+                height=4,
+                width=60,
+                wrap="word",
+                bg="#2d2d2d",
+                fg="#e0e0e0",
+                insertbackground="#e0e0e0",
+                selectbackground="#3d3d3d",
+                selectforeground="#ffffff",
+            )
+            self.text_widget.grid(row=0, column=0, pady=(5, 0))
+            
+            self.text_scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=self.text_widget.yview)
+            self.text_scrollbar.grid(row=0, column=1, sticky="ns")
+            self.text_widget.configure(yscrollcommand=self.text_scrollbar.set)
+        else:
+            # Update existing text widget
+            self.text_widget.delete("1.0", tk.END)
+            self.text_widget.grid()
+            if self.text_scrollbar:
+                self.text_scrollbar.grid()
+        
+        self.answer_frame.grid()
+    
+    def _generate_audio_for_card(self, card: LessonCard) -> None:
+        """Generate TTS audio for a card asynchronously."""
+        if not card.audio_text:
+            logger.warning("Card has no audio_text, cannot generate audio")
+            self.audio_player.status_label.configure(text="No audio text available")
+            return
+        
+        language = self.controller.selected_language or "Spanish"
+        
+        def on_audio_complete(audio_path: Optional[str]) -> None:
+            """Callback when audio generation completes."""
+            def update_ui():
+                if audio_path:
+                    card.audio_path = audio_path
+                    self.current_audio_path = audio_path
+                    self.audio_player.set_audio(audio_path)
+                    logger.ui(f"Audio ready for playback: {audio_path}")
+                else:
+                    self.audio_player.status_label.configure(text="Failed to generate audio")
+                    logger.error("Audio generation failed")
+            
+            # Update UI on main thread
+            self.after(0, update_ui)
+        
+        # Generate audio in background
+        generate_speech_async(card.audio_text, language, on_audio_complete)
     
     def _render_text_input(self, card: LessonCard) -> None:
         """Render text input area."""
@@ -1425,13 +1962,12 @@ class LessonCardView(ttk.Frame):
         
         if not hasattr(self, 'text_widget') or not self.text_widget:
             text_frame = ttk.Frame(self.answer_frame)
-            text_frame.grid(row=0, column=0, sticky="nsew")
-            self.answer_frame.rowconfigure(0, weight=1)
-            self.answer_frame.columnconfigure(0, weight=1)
+            text_frame.grid(row=0, column=0)
             
             self.text_widget = tk.Text(
                 text_frame, 
-                height=6, 
+                height=6,
+                width=60,  # Fixed width for consistent centering
                 wrap="word",
                 bg="#2d2d2d",  # Dark background
                 fg="#e0e0e0",  # Light text
@@ -1439,9 +1975,7 @@ class LessonCardView(ttk.Frame):
                 selectbackground="#3d3d3d",  # Dark selection background
                 selectforeground="#ffffff",  # White selected text
             )
-            self.text_widget.grid(row=0, column=0, sticky="nsew", pady=(5, 0))
-            text_frame.rowconfigure(0, weight=1)
-            text_frame.columnconfigure(0, weight=1)
+            self.text_widget.grid(row=0, column=0, pady=(5, 0))
             
             self.text_scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=self.text_widget.yview)
             self.text_scrollbar.grid(row=0, column=1, sticky="ns")
@@ -1454,14 +1988,22 @@ class LessonCardView(ttk.Frame):
     def _clear_card_widgets(self) -> None:
         """Clear all card rendering widgets."""
         self.answer_frame.grid_remove()
-        if hasattr(self, 'mc_buttons'):
-            for btn in self.mc_buttons:
-                btn.destroy()
-            self.mc_buttons = []
-        if hasattr(self, 'text_widget') and self.text_widget:
-            self.text_widget.grid_remove()
+        
+        # Destroy ALL children of answer_frame to prevent layout issues
+        for child in self.answer_frame.winfo_children():
+            child.destroy()
+        
+        # Reset widget references
+        self.mc_buttons = []
+        self.text_widget = None
+        self.text_scrollbar = None
         if hasattr(self, 'vocab_label'):
-            self.vocab_label.grid_remove()
+            self.vocab_label = None
+        
+        # Clean up audio player (now in content frame)
+        if self.audio_player:
+            self.audio_player.stop()
+            self.audio_player.grid_remove()
     
     def _on_mc_selected(self, index: int) -> None:
         """Handle multiple choice selection - buttons stay depressed (radio button style)."""
@@ -1475,18 +2017,8 @@ class LessonCardView(ttk.Frame):
     
     def _display_image(self, image_path: str) -> None:
         """Display an image from path."""
-        try:
-            img = Image.open(image_path)
-            img.thumbnail((600, 400))
-            photo = ImageTk.PhotoImage(img)
-            if not hasattr(self.controller, 'current_lesson_photo'):
-                self.controller.current_lesson_photo = photo
-            self.controller.current_lesson_photo = photo
-            self.image_label.configure(image=photo, text="")
-            self.image_label.grid()
-        except Exception:
-            self.image_label.configure(text="[Could not display image]", image="")
-            self.image_label.grid()
+        self.responsive_image.set_image(image_path)
+        self.responsive_image.grid()
     
     
     def update_image_if_needed(self, image_prompt: str, image_path: str) -> None:
@@ -1620,6 +2152,7 @@ class SummaryCard(ttk.Frame):
             self.content,
             text="Session Summary",
             font=("Helvetica", 28, "bold"),
+            anchor="center",
             foreground="#ffffff",  # White text on dark background
         )
         title.grid(row=0, column=0, pady=(30, 15))
@@ -1633,10 +2166,11 @@ class SummaryCard(ttk.Frame):
             text="", 
             wraplength=600, 
             justify="center",
+            anchor="center",
             font=("Helvetica", 14),
             foreground="#d0d0d0",  # Light gray text on dark background
         )
-        self.summary_label.grid(row=1, column=0, padx=30, pady=(0, 30), sticky="ew")
+        self.summary_label.grid(row=1, column=0, padx=30, pady=(0, 30))
         self.scrollable.canvas.bind("<Configure>", self._on_summary_resize)
 
         button_frame = ttk.Frame(self.content)

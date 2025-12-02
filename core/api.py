@@ -81,6 +81,11 @@ logger.env(f"Supported languages: {', '.join(SUPPORTED_LANGUAGES)}")
 logger.separator("API Module Ready")
 
 
+def is_api_available() -> bool:
+    """Check if the OpenAI API client is properly configured."""
+    return client is not None
+
+
 # ---------------------------------------------------------------------------
 # Scene generation
 # ---------------------------------------------------------------------------
@@ -376,6 +381,162 @@ def generate_scene_image(image_prompt: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Text-to-Speech (TTS) Generation
+# ---------------------------------------------------------------------------
+
+# Voice options for different languages
+# OpenAI TTS supports these voices: alloy, echo, fable, onyx, nova, shimmer
+# Different voices work better for different languages
+LANGUAGE_VOICE_MAP = {
+    "Spanish": "nova",      # Clear female voice, good for Romance languages
+    "French": "shimmer",    # Soft female voice, good for French
+    "German": "onyx",       # Deep male voice, clear pronunciation
+    "Arabic": "echo",       # Male voice, good for Arabic
+    "Japanese": "nova",     # Female voice, clear for Japanese
+    "Chinese": "nova",      # Female voice, works well for tonal languages
+}
+
+DEFAULT_TTS_VOICE = "nova"
+DEFAULT_TTS_MODEL = "tts-1"  # Use tts-1 for speed, tts-1-hd for quality
+
+logger.env(f"Default TTS model: {DEFAULT_TTS_MODEL}")
+
+
+def get_voice_for_language(language: str) -> str:
+    """Get the appropriate TTS voice for a given language."""
+    return LANGUAGE_VOICE_MAP.get(language, DEFAULT_TTS_VOICE)
+
+
+def generate_speech(
+    text: str,
+    language: str,
+    voice: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Generate speech audio from text using OpenAI's TTS API.
+    
+    Args:
+        text: The text to convert to speech (in the target language)
+        language: The target language (used to select appropriate voice)
+        voice: Optional specific voice to use (overrides language default)
+    
+    Returns:
+        Path to the generated MP3 audio file, or None on failure
+    """
+    if client is None:
+        logger.warning("OpenAI client not available, skipping TTS generation")
+        return None
+    
+    if not text or not text.strip():
+        logger.warning("Empty text provided for TTS")
+        return None
+    
+    selected_voice = voice or get_voice_for_language(language)
+    logger.api(f"generate_speech() - {len(text)} chars, voice={selected_voice}, lang={language}")
+    
+    try:
+        logger.api_call("audio.speech.create", model=DEFAULT_TTS_MODEL, voice=selected_voice)
+        
+        with Timer() as timer:
+            response = client.audio.speech.create(
+                model=DEFAULT_TTS_MODEL,
+                voice=selected_voice,
+                input=text,
+                response_format="mp3",
+            )
+        
+        logger.api_response("audio.speech.create", duration_ms=timer.duration_ms)
+        
+        # Save to temporary file
+        fd, path = tempfile.mkstemp(suffix=".mp3", prefix="gait_speech_")
+        with os.fdopen(fd, "wb") as f:
+            # Stream the response content to file
+            for chunk in response.iter_bytes():
+                f.write(chunk)
+        
+        logger.success(f"TTS audio saved: {path} ({timer.duration_ms:.0f}ms)")
+        return path
+        
+    except Exception as e:
+        logger.error(f"TTS generation failed: {e}")
+        return None
+
+
+def generate_speech_async(
+    text: str,
+    language: str,
+    callback: Callable[[Optional[str]], None],
+    voice: Optional[str] = None,
+) -> None:
+    """
+    Generate speech asynchronously in a background thread.
+    Calls callback with the audio file path when done, or None on error.
+    
+    Args:
+        text: The text to convert to speech
+        language: The target language
+        callback: Function to call with the result
+        voice: Optional specific voice to use
+    """
+    logger.task_start("async_speech_generation")
+    
+    def _generate():
+        start_time = time.perf_counter()
+        path = generate_speech(text, language, voice)
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        
+        if path:
+            logger.task_complete("async_speech_generation", duration_ms=duration_ms)
+        else:
+            logger.task_error("async_speech_generation", "Speech generation returned None")
+        
+        callback(path)
+    
+    thread = threading.Thread(target=_generate, daemon=True)
+    thread.start()
+
+
+def generate_audio_for_cards(
+    cards: List,
+    language: str,
+    callback: Callable[[int, Optional[str]], None],
+) -> None:
+    """
+    Generate audio for multiple cards that have audio_text.
+    Processes cards in parallel for speed.
+    
+    Args:
+        cards: List of LessonCard objects
+        language: Target language for TTS
+        callback: Called with (card_index, audio_path) for each completed card
+    """
+    audio_cards = [
+        (i, card) for i, card in enumerate(cards)
+        if hasattr(card, 'audio_text') and card.audio_text
+    ]
+    
+    if not audio_cards:
+        logger.api("No audio cards to process")
+        return
+    
+    logger.separator(f"Generating Audio for {len(audio_cards)} Cards")
+    logger.task_start(f"parallel_audio_generation ({len(audio_cards)} files)")
+    
+    def _generate_for_card(index: int, card) -> None:
+        logger.api(f"[Audio {index + 1}] Generating for: {card.audio_text[:50]}...")
+        path = generate_speech(card.audio_text, language)
+        callback(index, path)
+    
+    # Start all audio generations in parallel
+    for card_index, card in audio_cards:
+        thread = threading.Thread(
+            target=lambda idx=card_index, c=card: _generate_for_card(idx, c),
+            daemon=True
+        )
+        thread.start()
+
+
+# ---------------------------------------------------------------------------
 # Evaluation of learner text
 # ---------------------------------------------------------------------------
 
@@ -615,6 +776,10 @@ def generate_assessment_cards(language: str) -> List[AssessmentCard]:
                     "IMPORTANT: Create RANDOM and VARIED assessment questions each time. "
                     "Do NOT use the same examples (like 'red apple'). Use diverse subjects: "
                     "animals, objects, scenes, activities, food, nature, etc.\n\n"
+                    "CRITICAL LANGUAGE RULE: ALL questions, instructions, and prompts MUST be written in ENGLISH. "
+                    "The learner's responses should be in the target language, but all UI text you provide "
+                    "(questions, instructions, feedback) must be in English. This is essential because learners "
+                    "may be beginners and would find questions in the target language intimidating.\n\n"
                     f"{ASSESSMENT_CARD_SCHEMA}\n\n"
                     "Return ONLY a JSON object with this structure:\n"
                     "{\n"
@@ -861,6 +1026,9 @@ def _json_to_lesson_card(card_data: Dict[str, Any]) -> LessonCard:
     if options and card_type == "multiple_choice":
         options = [_clean_option_text(opt) for opt in options]
     
+    # Handle comprehension questions for audio_comprehension cards
+    comprehension_questions = card_data.get("comprehension_questions", []) or []
+    
     return LessonCard(
         type=card_type,
         question=card_data.get("question"),
@@ -874,6 +1042,8 @@ def _json_to_lesson_card(card_data: Dict[str, Any]) -> LessonCard:
         translation=card_data.get("translation"),
         example=card_data.get("example"),
         related_words=card_data.get("related_words", []) or [],
+        audio_text=card_data.get("audio_text"),
+        comprehension_questions=comprehension_questions,
         feedback=card_data.get("feedback"),
         vocabulary_expansion=card_data.get("vocabulary_expansion", []) or [],
     )
@@ -954,14 +1124,39 @@ def generate_lesson_plan_from_assessment_responses(
                     "Requirements:\n"
                     "- FIRST: Analyze assessment responses to determine proficiency level\n"
                     "- THEN: Create exactly 10 diverse lesson cards AT that proficiency level\n"
-                    "- Use a mix of card types (multiple_choice, fill_in_blank, image_question, vocabulary)\n"
-                    "- Include image_prompts for most cards (at least 7 out of 10)\n"
+                    "- Use a mix of card types: multiple_choice, fill_in_blank, image_question, vocabulary, audio_transcription, audio_comprehension\n"
+                    "- Include image_prompts for visual cards (at least 5 out of 10)\n"
+                    "- IMPORTANT: Include 2-3 AUDIO cards (audio_transcription or audio_comprehension) to develop listening skills\n"
                     "- CRITICAL: Lesson difficulty must match the assessed proficiency level exactly\n"
                     "- Every card MUST focus on building LANGUAGE SKILLS (grammar practice, vocabulary usage, sentence construction, comprehension, speaking/writing prompts, pronunciation cues, etc.). Avoid pure trivia like geography/history unless it explicitly requires using the target language.\n"
                     "- Each card should have feedback and vocabulary_expansion\n"
-                    f"- All content should be in {language}\n"
                     "- IMPORTANT: Lessons should be INDEPENDENT and can be completed in any order.\n"
                     "- Each lesson card should be self-contained - don't reference previous cards.\n\n"
+                    "AUDIO CARD REQUIREMENTS:\n"
+                    "- audio_transcription: Short 1-3 sentences in the target language for dictation practice\n"
+                    "  - audio_text must be in " + language + " (target language)\n"
+                    "  - correct_answer should match audio_text exactly\n"
+                    "  - Instruction in English: 'Listen to the audio and write what you hear.'\n"
+                    "- audio_comprehension: Longer passage (paragraph) with comprehension question\n"
+                    "  - audio_text: 3-6 sentences in " + language + " telling a story or describing a situation\n"
+                    "  - question: Ask about the content IN ENGLISH\n"
+                    "  - correct_answer: The answer (can be in " + language + " or English depending on question)\n"
+                    "- For beginners (A1-A2): Simple sentences, slow pacing, common vocabulary\n"
+                    "- For intermediate (B1-B2): Complex sentences, natural pacing, varied vocabulary\n"
+                    "- For advanced (C1-C2): Native-speed, idioms, sophisticated structures\n\n"
+                    "CRITICAL LANGUAGE RULES (PROFICIENCY-BASED):\n"
+                    "- For BEGINNERS (A1-A2 proficiency): ALL questions and instructions MUST be in ENGLISH.\n"
+                    "  This is essential because beginners would find questions in the target language intimidating.\n"
+                    f"  Example: Question='What is the word for \"dog\" in {language}?'\n"
+                    f"- For INTERMEDIATE/ADVANCED (B1, B2, C1, C2 proficiency): Questions and instructions should be in {language} (the target language).\n"
+                    f"  This provides immersive practice. Example: Question in {language} asking about vocabulary or grammar.\n"
+                    "- IMPORTANT: Determine the question language based on the assessed proficiency level:\n"
+                    "  * A1, A2 → Questions in ENGLISH\n"
+                    f"  * B1, B2, C1, C2 → Questions in {language}\n"
+                    f"- The learner's expected answers should ALWAYS be in {language} (target language)\n"
+                    f"- Multiple choice OPTIONS should ALWAYS be in {language}\n"
+                    f"- audio_text MUST ALWAYS be in {language} (it will be converted to speech)\n"
+                    "- Feedback text should ALWAYS be in ENGLISH (to ensure comprehension)\n\n"
                     "CRITICAL RULES:\n"
                     "- For multiple_choice: Do NOT include letter prefixes (A, B, C, D) in option text.\n"
                     "  Just provide plain option text like: ['quadratisch', 'rund', 'dreieckig']\n\n"
@@ -1082,16 +1277,44 @@ def generate_structured_lesson_plan(
                     "}\n\n"
                     "Requirements:\n"
                     "- Create exactly 10 diverse lesson cards\n"
-                    "- Use a mix of card types (multiple_choice, fill_in_blank, image_question, vocabulary)\n"
-                    "- Include image_prompts for most cards (at least 7 out of 10)\n"
+                    "- Use a mix of card types: multiple_choice, fill_in_blank, image_question, vocabulary, audio_transcription, audio_comprehension\n"
+                    "- Include image_prompts for visual cards (at least 5 out of 10)\n"
+                    "- IMPORTANT: Include 2-3 AUDIO cards (audio_transcription or audio_comprehension) to develop listening skills\n"
                     "- Target the learner's proficiency level\n"
                     "- Each card should have feedback and vocabulary_expansion\n"
-                    "- Vary difficulty slightly but keep it appropriate for the level\n"
-                    f"- All content should be in {language}\n\n"
-                    "CRITICAL RULES:\n"
+                    "- Vary difficulty slightly but keep it appropriate for the level\n\n"
+                    "AUDIO CARD REQUIREMENTS:\n"
+                    "- audio_transcription: Short 1-3 sentences in the target language for dictation practice\n"
+                    f"  - audio_text must be in {language} (target language)\n"
+                    "  - correct_answer should match audio_text exactly\n"
+                    "  - Instruction in English: 'Listen and write what you hear'\n"
+                    "- audio_comprehension: Longer passage (paragraph) with comprehension question\n"
+                    f"  - audio_text: 3-6 sentences in {language} telling a story or describing a situation\n"
+                    "  - question: Ask about the content IN ENGLISH\n"
+                    f"  - correct_answer: The answer (can be in {language} or English depending on question)\n"
+                    "- For beginners (A1-A2): Use simple sentences, common vocabulary\n"
+                    "- For intermediate (B1-B2): Use more complex sentences, varied vocabulary\n"
+                    "- For advanced (C1-C2): Use native-speed pacing, idioms, complex structures\n\n"
+                    "CRITICAL LANGUAGE RULES:\n"
+                    + (
+                        # For B1+ learners, questions should be in target language
+                        f"- The learner is at {assessment_result.proficiency} level (intermediate/advanced).\n"
+                        f"- Questions and instructions should be written in {language} (the target language) for immersive practice.\n"
+                        f"- This provides authentic language exposure appropriate for their level.\n"
+                        if assessment_result.proficiency in ("B1", "B2", "C1", "C2") else
+                        # For A1-A2 beginners, questions should be in English
+                        f"- The learner is at {assessment_result.proficiency} level (beginner).\n"
+                        "- ALL questions and instructions MUST be written in ENGLISH.\n"
+                        "- This is essential because beginners would find questions in the target language intimidating.\n"
+                        f"- Example: Question='What is the word for \"house\" in {language}?'\n"
+                    ) +
+                    f"- The learner's expected answers should ALWAYS be in {language} (target language)\n"
+                    f"- Multiple choice OPTIONS should ALWAYS be in {language}\n"
+                    f"- audio_text MUST ALWAYS be in {language} (it will be converted to speech)\n"
+                    "- Feedback text should ALWAYS be in ENGLISH (to ensure comprehension)\n\n"
+                    "OTHER RULES:\n"
                     "- For multiple_choice cards: Do NOT include letter prefixes (A, B, C, D) in option text.\n"
-                    "  Just provide plain option text like: ['quadratisch', 'rund', 'dreieckig']\n"
-                    "  The UI will automatically add 'A. ', 'B. ', etc.\n\n"
+                    "  Just provide plain option text. The UI will automatically add 'A. ', 'B. ', etc.\n\n"
                     "CRITICAL: Image prompts MUST be safe and educational:\n"
                     "- Use simple, everyday objects and scenes (e.g., 'a red apple on a white table', 'a friendly dog playing', 'a sunny beach with palm trees')\n"
                     "- Avoid: violence, weapons, adult content, controversial topics, anything inappropriate\n"
@@ -1158,10 +1381,40 @@ def _structured_lesson_plan_fallback(
     language: str
 ) -> LessonPlan:
     """Fallback lesson plan when API is unavailable."""
+    # Language-specific audio examples
+    audio_examples = {
+        "Spanish": {
+            "transcription": "Hola, ¿cómo estás?",
+            "comprehension": "María va al mercado todos los sábados. Ella compra frutas frescas y verduras. Le gusta especialmente las manzanas rojas.",
+        },
+        "French": {
+            "transcription": "Bonjour, comment allez-vous?",
+            "comprehension": "Pierre va au marché chaque samedi. Il achète des fruits frais et des légumes. Il aime particulièrement les pommes rouges.",
+        },
+        "German": {
+            "transcription": "Guten Tag, wie geht es Ihnen?",
+            "comprehension": "Maria geht jeden Samstag zum Markt. Sie kauft frisches Obst und Gemüse. Besonders mag sie rote Äpfel.",
+        },
+        "Japanese": {
+            "transcription": "こんにちは、お元気ですか？",
+            "comprehension": "マリアは毎週土曜日に市場に行きます。彼女は新鮮な果物と野菜を買います。特に赤いりんごが好きです。",
+        },
+        "Chinese": {
+            "transcription": "你好，你好吗？",
+            "comprehension": "玛丽亚每周六去市场。她买新鲜的水果和蔬菜。她特别喜欢红苹果。",
+        },
+        "Arabic": {
+            "transcription": "مرحبا، كيف حالك؟",
+            "comprehension": "ماريا تذهب إلى السوق كل يوم سبت. تشتري الفواكه الطازجة والخضروات. تحب التفاح الأحمر بشكل خاص.",
+        },
+    }
+    
+    audio_data = audio_examples.get(language, audio_examples["Spanish"])
+    
     cards = [
         LessonCard(
             type="image_question",
-            question="What is this?" if language != "Japanese" else "これは何ですか？",
+            question="What is this?",
             image_prompt="a simple red apple on a white table, educational illustration",
             correct_answer="apple",
             feedback="Great job!",
@@ -1175,6 +1428,26 @@ def _structured_lesson_plan_fallback(
             feedback="Correct!",
             vocabulary_expansion=["greeting", "polite"],
         ),
+        # Audio transcription card
+        LessonCard(
+            type="audio_transcription",
+            instruction="Listen to the audio and write what you hear.",
+            audio_text=audio_data["transcription"],
+            correct_answer=audio_data["transcription"],
+            feedback="Great listening skills!",
+            vocabulary_expansion=["greeting", "question"],
+        ),
+        # Audio comprehension card
+        LessonCard(
+            type="audio_comprehension",
+            instruction="Listen to the passage and answer the question below.",
+            audio_text=audio_data["comprehension"],
+            question="Where does Maria go every Saturday?",
+            correct_answer="the market",
+            alternatives=["market", "to the market"],
+            feedback="Good comprehension!",
+            vocabulary_expansion=["market", "Saturday", "fresh"],
+        ),
     ]
     # Fill to 10 cards with simple variations using safe prompts
     safe_prompts = [
@@ -1184,14 +1457,12 @@ def _structured_lesson_plan_fallback(
         "a blue bicycle leaning against a wall, clear educational image",
         "a beautiful flower garden with colorful flowers, simple style",
         "a cheerful dog playing with a ball, friendly illustration",
-        "a cozy library with books on shelves, educational scene",
-        "a happy family having a picnic in a park, simple illustration",
     ]
     card_idx = 0
     prompt_idx = 0
     while len(cards) < 10:
-        # Create variation with different safe image prompts
-        base_card = cards[card_idx % len(cards)]
+        # Create variation with different safe image prompts (skip audio cards for variations)
+        base_card = cards[card_idx % 2]  # Only use first two visual cards as templates
         new_card = LessonCard(
             type=base_card.type,
             question=base_card.question,
@@ -1251,6 +1522,16 @@ def evaluate_card_response(
         logger.debug(f"Text response evaluation (API required), response length: {len(user_response)}")
         return _evaluate_text_response_with_api(card, user_response, language)
     
+    # Audio transcription: compare user's transcription to the original audio text
+    if card.type == "audio_transcription" and user_response:
+        logger.debug(f"Audio transcription evaluation, response length: {len(user_response)}")
+        return _evaluate_audio_transcription(card, user_response, language)
+    
+    # Audio comprehension: evaluate answer to comprehension question
+    if card.type == "audio_comprehension" and user_response:
+        logger.debug(f"Audio comprehension evaluation, response length: {len(user_response)}")
+        return _evaluate_text_response_with_api(card, user_response, language)
+    
     # Fallback for other types
     logger.debug("Using fallback evaluation (no response or unknown type)")
     return {
@@ -1261,6 +1542,96 @@ def evaluate_card_response(
         "alternatives": card.alternatives or [],
         "vocabulary_expansion": card.vocabulary_expansion or [],
     }
+
+
+def _evaluate_audio_transcription(
+    card: LessonCard,
+    user_response: str,
+    language: str
+) -> Dict[str, Any]:
+    """
+    Evaluate an audio transcription response.
+    Uses API to check similarity accounting for minor spelling variations.
+    """
+    if not client:
+        # Simple fallback: exact match check
+        is_correct = user_response.strip().lower() == (card.audio_text or "").strip().lower()
+        return {
+            "is_correct": is_correct,
+            "card_score": 100 if is_correct else 50,
+            "feedback": "Correct!" if is_correct else f"The correct transcription was: {card.audio_text}",
+            "correct_answer": card.audio_text or "",
+            "alternatives": card.alternatives or [],
+            "vocabulary_expansion": card.vocabulary_expansion or [],
+        }
+    
+    try:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a language tutor evaluating a student's audio transcription. "
+                    "Compare the student's transcription to the original text. "
+                    "Be lenient with minor spelling errors, punctuation, and capitalization. "
+                    "Focus on whether the student correctly heard and understood the audio.\n\n"
+                    "Return ONLY a JSON object:\n"
+                    "{\n"
+                    '  "is_correct": true/false (true if substantially correct),\n'
+                    '  "card_score": 0-100 (100=perfect, 80-99=minor errors, 50-79=partial, 0-49=mostly wrong),\n'
+                    '  "feedback": "Constructive feedback on their listening/transcription",\n'
+                    '  "errors": ["List of specific errors if any"],\n'
+                    '  "vocabulary_expansion": ["Key vocabulary from the transcription"]\n'
+                    "}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "target_language": language,
+                        "original_text": card.audio_text or "",
+                        "user_transcription": user_response,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        
+        logger.api_call("chat.completions.create (transcription evaluation)", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.3,
+                max_tokens=500,
+            )
+        logger.api_response("chat.completions.create", duration_ms=timer.duration_ms)
+        
+        raw = completion.choices[0].message.content
+        data = json.loads(raw)
+        
+        return {
+            "is_correct": data.get("is_correct", False),
+            "card_score": int(data.get("card_score", 0)),
+            "feedback": data.get("feedback", "Check your transcription."),
+            "correct_answer": card.audio_text or "",
+            "alternatives": card.alternatives or [],
+            "vocabulary_expansion": data.get("vocabulary_expansion", []) or card.vocabulary_expansion or [],
+        }
+        
+    except Exception as e:
+        logger.error(f"Transcription evaluation failed: {e}")
+        # Fallback to simple comparison
+        is_correct = user_response.strip().lower() == (card.audio_text or "").strip().lower()
+        return {
+            "is_correct": is_correct,
+            "card_score": 100 if is_correct else 50,
+            "feedback": "Correct!" if is_correct else f"The correct transcription was: {card.audio_text}",
+            "correct_answer": card.audio_text or "",
+            "alternatives": card.alternatives or [],
+            "vocabulary_expansion": card.vocabulary_expansion or [],
+        }
 
 
 def _evaluate_text_response_with_api(

@@ -68,8 +68,43 @@ The lesson card JSON structure supports the following card types:
      "related_words": ["Related word 1", "Related word 2"]
    }
 
+6. "audio_transcription" - Listen and transcribe exercise (1-3 sentences)
+   {
+     "type": "audio_transcription",
+     "instruction": "Listen to the audio and write what you hear in [target language].",
+     "audio_text": "The text in target language that will be spoken (1-3 sentences)",
+     "correct_answer": "Same as audio_text (for comparison)",
+     "alternatives": ["Acceptable alternative transcriptions"],
+     "feedback": "Feedback shown after submission",
+     "vocabulary_expansion": ["Key vocabulary from the audio"]
+   }
+   The audio_text will be converted to speech using TTS. Keep it short (1-3 sentences)
+   for transcription exercises. Focus on clear, common vocabulary and grammar patterns.
+
+7. "audio_comprehension" - Listen to longer audio and answer questions
+   {
+     "type": "audio_comprehension",
+     "instruction": "Listen to the passage and answer the question below.",
+     "audio_text": "A longer passage in target language (paragraph or two)",
+     "question": "Question about the audio content (in English)",
+     "correct_answer": "Expected answer (can be in target language or English)",
+     "alternatives": ["Alternative correct answers"],
+     "comprehension_questions": [
+       {
+         "question": "Additional question about the passage",
+         "correct_answer": "Answer",
+         "alternatives": ["Alt answer"]
+       }
+     ],
+     "feedback": "Feedback explaining the correct answer",
+     "vocabulary_expansion": ["Key vocabulary from the passage"]
+   }
+   Audio comprehension uses longer passages and tests understanding through questions.
+   Questions should be in English, but answers may be in the target language.
+
 All cards should target the learner's proficiency level.
 Images should be used frequently to aid learning.
+Audio exercises help develop listening skills - include 2-3 audio cards per lesson.
 
 IMPORTANT: Image prompts must be safe and educational:
 - Use simple, everyday objects and scenes (e.g., "a red apple", "a friendly cat", "a sunny park")

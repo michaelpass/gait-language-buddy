@@ -35,7 +35,10 @@ class AssessmentResult:
 @dataclass
 class LessonCard:
     """Represents a single structured lesson card."""
-    type: Literal["text_question", "multiple_choice", "image_question", "fill_in_blank", "vocabulary"]
+    type: Literal[
+        "text_question", "multiple_choice", "image_question", 
+        "fill_in_blank", "vocabulary", "audio_transcription", "audio_comprehension"
+    ]
     question: Optional[str] = None          # Question text (for question types)
     instruction: Optional[str] = None       # Optional instruction in English
     image_prompt: Optional[str] = None      # Prompt for image generation
@@ -54,6 +57,11 @@ class LessonCard:
     translation: Optional[str] = None
     example: Optional[str] = None
     related_words: List[str] = field(default_factory=list)
+    
+    # For audio_transcription and audio_comprehension
+    audio_text: Optional[str] = None        # Text to be converted to speech (in target language)
+    audio_path: Optional[str] = None        # Path to generated audio file (filled by client)
+    comprehension_questions: List[Dict[str, Any]] = field(default_factory=list)  # For audio_comprehension
     
     # Feedback and vocabulary expansion
     feedback: Optional[str] = None          # Feedback shown after submission
@@ -83,5 +91,9 @@ class AssessmentCard:
 
 @dataclass
 class AudioInfo:
-    """Placeholder for future audio support (not yet used)."""
-    path: Optional[str] = None
+    """Information about a generated audio file."""
+    path: Optional[str] = None              # Path to the audio file
+    text: Optional[str] = None              # Original text that was spoken
+    language: Optional[str] = None          # Language of the audio
+    voice: Optional[str] = None             # Voice used for generation
+    duration_seconds: Optional[float] = None  # Duration of the audio
