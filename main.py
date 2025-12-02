@@ -50,6 +50,110 @@ logger.banner("GAIT Language Buddy - Starting Application")
 
 
 # ---------------------------------------------------------------------------
+# Scrollable Frame Widget (for cards that may exceed window height)
+# ---------------------------------------------------------------------------
+
+class ScrollableFrame(ttk.Frame):
+    """
+    A frame that provides vertical scrolling for its content.
+    
+    Usage:
+        scrollable = ScrollableFrame(parent)
+        scrollable.pack(fill="both", expand=True)
+        
+        # Add widgets to scrollable.content instead of scrollable directly
+        ttk.Label(scrollable.content, text="Hello").pack()
+    """
+    
+    def __init__(self, parent, **kwargs) -> None:
+        super().__init__(parent, **kwargs)
+        
+        # Create canvas and scrollbar
+        self.canvas = tk.Canvas(
+            self,
+            highlightthickness=0,
+            background="#1e1e1e",
+        )
+        self.scrollbar = ttk.Scrollbar(
+            self,
+            orient="vertical",
+            command=self.canvas.yview,
+        )
+        
+        # Create the content frame inside canvas
+        self.content = ttk.Frame(self.canvas)
+        
+        # Create window in canvas for content frame
+        self.content_window = self.canvas.create_window(
+            (0, 0),
+            window=self.content,
+            anchor="nw",
+        )
+        
+        # Configure scrollbar
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        
+        # Layout
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+        
+        # Bind events
+        self.content.bind("<Configure>", self._on_content_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        
+        # Bind mousewheel scrolling
+        self._bind_mousewheel()
+    
+    def _on_content_configure(self, event: tk.Event) -> None:
+        """Update scroll region when content changes."""
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+    
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        """Resize content width to match canvas width."""
+        # Make content fill canvas width
+        self.canvas.itemconfigure(self.content_window, width=event.width)
+    
+    def _bind_mousewheel(self) -> None:
+        """Bind mousewheel events for scrolling."""
+        # Bind to canvas and all children
+        self.canvas.bind("<Enter>", self._bind_wheel_events)
+        self.canvas.bind("<Leave>", self._unbind_wheel_events)
+    
+    def _bind_wheel_events(self, event: tk.Event) -> None:
+        """Bind mousewheel when mouse enters."""
+        # Windows and macOS have different mousewheel events
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        # Linux uses Button-4 and Button-5
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel_linux)
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel_linux)
+    
+    def _unbind_wheel_events(self, event: tk.Event) -> None:
+        """Unbind mousewheel when mouse leaves."""
+        self.canvas.unbind_all("<MouseWheel>")
+        self.canvas.unbind_all("<Button-4>")
+        self.canvas.unbind_all("<Button-5>")
+    
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        """Handle mousewheel on Windows/macOS."""
+        # event.delta is positive for scroll up, negative for scroll down
+        # Windows: delta is typically 120 or -120
+        # macOS: delta can be smaller values
+        if event.delta:
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    
+    def _on_mousewheel_linux(self, event: tk.Event) -> None:
+        """Handle mousewheel on Linux."""
+        if event.num == 4:
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.canvas.yview_scroll(1, "units")
+    
+    def scroll_to_top(self) -> None:
+        """Scroll content to top."""
+        self.canvas.yview_moveto(0)
+
+
+# ---------------------------------------------------------------------------
 # Loading Spinner Widget
 # ---------------------------------------------------------------------------
 
@@ -128,9 +232,10 @@ class LanguageBuddyApp(tk.Tk):
         center_y = int(screen_height/2 - window_height/2)
         
         self.geometry(f"{window_width}x{window_height}+{center_x}+{center_y}")
-        self.min_app_width = 750
-        self.min_app_height = 650
-        self.minsize(self.min_app_width, self.min_app_height)  # Minimum size to ensure usability
+        # Allow smaller windows - scrolling will handle overflow
+        self.min_app_width = 400
+        self.min_app_height = 300
+        self.minsize(self.min_app_width, self.min_app_height)
         
         # Configure style for dark theme
         self.configure(bg="#1e1e1e")  # Dark background
@@ -194,25 +299,6 @@ class LanguageBuddyApp(tk.Tk):
 
         logger.ui("Application initialized successfully")
         self.show_card("IntroCard")
-
-    def adjust_window_to_content(self, content_widget: ttk.Frame, padding: int = 120) -> None:
-        """Adjust the application window height/width to fit the currently visible content."""
-        try:
-            self.update_idletasks()
-            content_widget.update_idletasks()
-            required_width = content_widget.winfo_reqwidth() + padding
-            required_height = content_widget.winfo_reqheight() + padding
-            width = max(self.min_app_width, required_width)
-            height = max(self.min_app_height, required_height)
-
-            # Only resize when there is a meaningful difference
-            current_geom = self.geometry().split("+")[0]
-            current_width, current_height = [int(val) for val in current_geom.split("x")]
-            if abs(width - current_width) > 5 or abs(height - current_height) > 5:
-                self.geometry(f"{int(width)}x{int(height)}")
-        except Exception:
-            # Fallback to current geometry; avoid crashing on resize attempts
-            pass
 
     # Card management -------------------------------------------------------
 
@@ -593,20 +679,16 @@ class IntroCard(ttk.Frame):
         super().__init__(parent)
         self.controller = controller
 
-        # Center content in window - add side spacers
-        self.columnconfigure(0, weight=1)  # Left spacer
-        self.columnconfigure(1, weight=0)  # Center column - no expansion, sized by content
-        self.columnconfigure(2, weight=1)  # Right spacer
-        self.rowconfigure(0, weight=1)  # Top spacer
-        self.rowconfigure(2, weight=1)  # Bottom spacer
+        # Use scrollable frame for content
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
         
-        # Content wrapper - sized by content, centered by spacers
-        content_frame = ttk.Frame(self)
-        content_frame.grid(row=1, column=1, sticky="ns")
-        self.content = content_frame
-        content_frame.columnconfigure(0, weight=1)
-        content_frame.rowconfigure(0, weight=1)
-        content_frame.rowconfigure(5, weight=1)
+        self.scrollable = ScrollableFrame(self)
+        self.scrollable.grid(row=0, column=0, sticky="nsew")
+        self.content = self.scrollable.content
+        
+        # Configure content to center widgets
+        self.content.columnconfigure(0, weight=1)
 
         title = ttk.Label(
             self.content,
@@ -615,7 +697,7 @@ class IntroCard(ttk.Frame):
             anchor="center",
             foreground="#ffffff",  # White text on dark background
         )
-        title.grid(row=1, column=0, pady=(40, 20), padx=20, sticky="ew")
+        title.grid(row=0, column=0, pady=(40, 20), padx=20, sticky="ew")
 
         desc_text = (
             "Welcome! This tool helps you learn and practice another language with personalized lessons.\n\n"
@@ -634,11 +716,11 @@ class IntroCard(ttk.Frame):
             font=("Helvetica", 14),
             foreground="#d0d0d0",  # Light gray text on dark background
         )
-        desc.grid(row=2, column=0, padx=80, pady=(0, 30), sticky="ew")
+        desc.grid(row=1, column=0, padx=40, pady=(0, 30), sticky="ew")
         self.desc_label = desc
 
         lang_frame = ttk.Frame(self.content)
-        lang_frame.grid(row=3, column=0, padx=40, pady=(0, 20))
+        lang_frame.grid(row=2, column=0, padx=40, pady=(0, 20))
 
         ttk.Label(lang_frame, text="Choose your target language:", font=("Helvetica", 14)).grid(
             row=0, column=0, sticky="w", padx=(0, 10)
@@ -672,15 +754,15 @@ class IntroCard(ttk.Frame):
             text="Start Session",
             command=self._on_start_clicked,
         )
-        start_button.grid(row=4, column=0, pady=(20, 50))
+        start_button.grid(row=3, column=0, pady=(20, 50))
         
         # Style the button to be more prominent
         style = ttk.Style()
         style.configure("Start.TButton", font=("Helvetica", 14, "bold"), padding=10)
         start_button.configure(style="Start.TButton")
 
-        # Responsive wrapping
-        self.content.bind("<Configure>", self._on_content_resize)
+        # Responsive wrapping - bind to scrollable canvas for width changes
+        self.scrollable.canvas.bind("<Configure>", self._on_content_resize)
 
     def _on_start_clicked(self) -> None:
         language = self.language_var.get()
@@ -696,9 +778,7 @@ class IntroCard(ttk.Frame):
 
     def _on_content_resize(self, event: tk.Event) -> None:
         """Adjust intro text wrapping when the window size changes."""
-        if event.widget is not self.content:
-            return
-        available = max(300, event.width - 160)
+        available = max(200, event.width - 80)
         self.desc_label.configure(wraplength=available)
 
 
@@ -714,20 +794,16 @@ class AssessmentCardView(ttk.Frame):
         self.controller = controller
         self.current_card: Optional[AssessmentCard] = None
 
-        # Center content in window - add side spacers
-        self.columnconfigure(0, weight=1)  # Left spacer
-        self.columnconfigure(1, weight=0)  # Center column - no expansion, sized by content
-        self.columnconfigure(2, weight=1)  # Right spacer
-        self.rowconfigure(0, weight=1)  # Top spacer
-        self.rowconfigure(2, weight=1)  # Bottom spacer
+        # Use scrollable frame for content
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
         
-        # Content wrapper - sized by content, centered by spacers
-        content_frame = ttk.Frame(self)
-        content_frame.grid(row=1, column=1, sticky="ns")
-        self.content = content_frame
-        content_frame.columnconfigure(0, weight=1)
-        content_frame.rowconfigure(0, weight=1)
-        content_frame.rowconfigure(7, weight=1)
+        self.scrollable = ScrollableFrame(self)
+        self.scrollable.grid(row=0, column=0, sticky="nsew")
+        self.content = self.scrollable.content
+        
+        # Configure content to center widgets
+        self.content.columnconfigure(0, weight=1)
 
         self.title_label = ttk.Label(
             self.content,
@@ -736,7 +812,7 @@ class AssessmentCardView(ttk.Frame):
             anchor="center",
             foreground="#ffffff",  # White text on dark background
         )
-        self.title_label.grid(row=1, column=0, pady=(30, 15), sticky="ew")
+        self.title_label.grid(row=0, column=0, pady=(30, 15), sticky="ew")
 
         self.stage_label = ttk.Label(
             self.content,
@@ -744,11 +820,11 @@ class AssessmentCardView(ttk.Frame):
             font=("Helvetica", 14),
             foreground="#7bb3ff",  # Light blue text on dark background
         )
-        self.stage_label.grid(row=2, column=0, pady=(0, 10))
+        self.stage_label.grid(row=1, column=0, pady=(0, 10))
 
         # Loading spinner (starts hidden)
         self.loading_spinner = LoadingSpinner(self.content, text="Generating assessment...")
-        self.loading_spinner.grid(row=3, column=0, pady=(20, 20))
+        self.loading_spinner.grid(row=2, column=0, pady=(20, 20))
 
         self.pending_instruction_text: str = ""
         self.waiting_for_image: bool = False
@@ -757,39 +833,39 @@ class AssessmentCardView(ttk.Frame):
         self.instruction_label = ttk.Label(
             self.content,
             text="",
-            wraplength=900,
+            wraplength=600,
             justify="left",
             font=("Helvetica", 14),
             foreground="#7bb3ff",  # Light blue text on dark background
         )
-        self.instruction_label.grid(row=4, column=0, padx=50, pady=(0, 10), sticky="w")
+        self.instruction_label.grid(row=3, column=0, padx=30, pady=(0, 10), sticky="ew")
 
         # Image loading status labels
         self.image_status_label = ttk.Label(
             self.content,
             text="",
-            wraplength=900,
+            wraplength=600,
             justify="left",
             font=("Helvetica", 13),
             foreground="#7bb3ff",
         )
-        self.image_status_label.grid(row=5, column=0, padx=50, sticky="w")
+        self.image_status_label.grid(row=4, column=0, padx=30, sticky="ew")
         self.image_status_label.grid_remove()
 
         self.image_status_detail_label = ttk.Label(
             self.content,
             text="",
-            wraplength=900,
+            wraplength=600,
             justify="left",
             font=("Helvetica", 12, "italic"),
             foreground="#9bc6ff",
         )
-        self.image_status_detail_label.grid(row=6, column=0, padx=50, pady=(0, 10), sticky="w")
+        self.image_status_detail_label.grid(row=5, column=0, padx=30, pady=(0, 10), sticky="ew")
         self.image_status_detail_label.grid_remove()
 
         # Image area (for image-based questions)
         self.image_label = ttk.Label(self.content)
-        self.image_label.grid(row=7, column=0, padx=20, pady=(0, 10))
+        self.image_label.grid(row=6, column=0, padx=20, pady=(0, 10))
         self.image_label.grid_remove()
 
         # Question label
@@ -797,15 +873,15 @@ class AssessmentCardView(ttk.Frame):
             self.content,
             text="",
             font=("Helvetica", 24, "bold"),
-            wraplength=900,
+            wraplength=600,
             justify="center",
             foreground="#ffffff",  # White text on dark background
         )
-        self.question_label.grid(row=8, column=0, padx=50, pady=(15, 8), sticky="ew")
+        self.question_label.grid(row=7, column=0, padx=30, pady=(15, 8), sticky="ew")
 
         # Answer area (dynamic based on card type)
         self.answer_frame = ttk.Frame(self.content)
-        self.answer_frame.grid(row=9, column=0, padx=50, pady=(0, 15), sticky="nsew")
+        self.answer_frame.grid(row=8, column=0, padx=30, pady=(0, 15), sticky="nsew")
         
         # Text input (for text questions)
         self.text_widget: Optional[tk.Text] = None
@@ -817,7 +893,7 @@ class AssessmentCardView(ttk.Frame):
             command=self._on_submit_clicked,
         )
         self.submit_button = submit_button
-        submit_button.grid(row=10, column=0, pady=(10, 20))
+        submit_button.grid(row=9, column=0, pady=(10, 40))
 
         # Responsive wrapping labels
         self._wrap_targets = [
@@ -826,7 +902,7 @@ class AssessmentCardView(ttk.Frame):
             self.image_status_detail_label,
             self.question_label,
         ]
-        self.content.bind("<Configure>", self._update_wraplengths)
+        self.scrollable.canvas.bind("<Configure>", self._update_wraplengths)
 
     # ------------------------------------------------------------------
     # Helper methods for instruction/status text
@@ -850,10 +926,8 @@ class AssessmentCardView(ttk.Frame):
 
     def _update_wraplengths(self, event: Optional[tk.Event] = None) -> None:
         """Keep instruction/question text wrapping responsive."""
-        if event and event.widget is not self.content:
-            return
-        width = self.content.winfo_width() or self.winfo_width()
-        wrap = max(250, width - 120)
+        width = self.scrollable.canvas.winfo_width() or self.winfo_width()
+        wrap = max(200, width - 60)
         for label in self._wrap_targets:
             label.configure(wraplength=wrap)
 
@@ -936,7 +1010,8 @@ class AssessmentCardView(ttk.Frame):
             self.waiting_for_image = False
             self.image_label.grid_remove()
 
-        self.controller.adjust_window_to_content(self.content)
+        # Scroll to top when showing new stage
+        self.scrollable.scroll_to_top()
 
 
     def _render_text_input(self) -> None:
@@ -999,7 +1074,6 @@ class AssessmentCardView(ttk.Frame):
         self.question_label.grid()
         self.answer_frame.grid()
         self.submit_button.grid()
-        self.controller.adjust_window_to_content(self.content)
 
 
     def update_image_if_needed(self, image_prompt: str, image_path: str) -> None:
@@ -1047,48 +1121,44 @@ class LessonCardView(ttk.Frame):
         super().__init__(parent)
         self.controller = controller
 
-        # Center content in window - add side spacers
-        self.columnconfigure(0, weight=1)  # Left spacer
-        self.columnconfigure(1, weight=0)  # Center column - no expansion, sized by content
-        self.columnconfigure(2, weight=1)  # Right spacer
-        self.rowconfigure(0, weight=1)  # Top spacer
-        self.rowconfigure(2, weight=1)  # Bottom spacer
+        # Use scrollable frame for content
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
         
-        # Content wrapper - sized by content, centered by spacers
-        content_frame = ttk.Frame(self)
-        content_frame.grid(row=1, column=1, sticky="nsew", pady=(10, 20))
-        self.content = content_frame
-        content_frame.columnconfigure(0, weight=1)
-        content_frame.rowconfigure(0, weight=1)
-        content_frame.rowconfigure(7, weight=1)
+        self.scrollable = ScrollableFrame(self)
+        self.scrollable.grid(row=0, column=0, sticky="nsew")
+        self.content = self.scrollable.content
+        
+        # Configure content to center widgets
+        self.content.columnconfigure(0, weight=1)
 
         self.title_label = ttk.Label(
             self.content,
             text="Lesson Prompts",
             font=("Helvetica", 24, "bold"),
         )
-        self.title_label.grid(row=1, column=0, pady=(20, 10))
+        self.title_label.grid(row=0, column=0, pady=(20, 10))
 
         self.subtitle_label = ttk.Label(
             self.content,
             text="Work through the prompts one by one.",
-            wraplength=900,
+            wraplength=600,
             justify="left",
             font=("Helvetica", 14),
             foreground="#d0d0d0",  # Light gray text on dark background
         )
-        self.subtitle_label.grid(row=2, column=0, padx=50, pady=(0, 15), sticky="w")
+        self.subtitle_label.grid(row=1, column=0, padx=30, pady=(0, 15), sticky="ew")
 
         # Loading spinner
         self.loading_spinner = LoadingSpinner(self.content, text="Evaluating and generating lesson...")
-        self.loading_spinner.grid(row=3, column=0, pady=(40, 40))
+        self.loading_spinner.grid(row=2, column=0, pady=(40, 40))
 
         self.progress_label = ttk.Label(
             self.content, 
             text="",
             foreground="#7bb3ff",  # Light blue text on dark background
         )
-        self.progress_label.grid(row=3, column=0, pady=(0, 10))
+        self.progress_label.grid(row=2, column=0, pady=(0, 10))
         
         # Image area (for image-based questions)
         self.image_label = ttk.Label(self.content)
@@ -1100,11 +1170,11 @@ class LessonCardView(ttk.Frame):
             self.content,
             text="",
             font=("Helvetica", 24, "bold"),
-            wraplength=900,
+            wraplength=600,
             justify="center",
             foreground="#ffffff",  # White text on dark background
         )
-        self.question_label.grid(row=4, column=0, padx=50, pady=(15, 8), sticky="ew")
+        self.question_label.grid(row=4, column=0, padx=30, pady=(15, 8), sticky="ew")
         
         # Answer area (dynamic based on card type)
         self.answer_frame = ttk.Frame(self.content)
@@ -1124,12 +1194,10 @@ class LessonCardView(ttk.Frame):
         self.next_button.grid(row=6, column=0, pady=(10, 20))
         self.submit_button = self.next_button
 
-        # Feedback card (full-width, scrollable)
+        # Feedback card (full-width)
         self.feedback_card = ttk.Frame(self.content)
-        self.feedback_card.grid(row=7, column=0, padx=20, pady=(5, 20), sticky="nsew")
-        self.content.rowconfigure(7, weight=1)
+        self.feedback_card.grid(row=7, column=0, padx=20, pady=(5, 40), sticky="nsew")
         self.feedback_card.columnconfigure(0, weight=1)
-        self.feedback_card.rowconfigure(1, weight=1)
         self.feedback_card.grid_remove()
 
         self.feedback_title = ttk.Label(
@@ -1141,34 +1209,15 @@ class LessonCardView(ttk.Frame):
         )
         self.feedback_title.grid(row=0, column=0, pady=(4, 6), sticky="ew")
 
-        self.feedback_canvas = tk.Canvas(
-            self.feedback_card,
-            highlightthickness=0,
-            background="#1e1e1e",
-        )
-        self.feedback_canvas.grid(row=1, column=0, sticky="nsew")
-        self.feedback_scrollbar = ttk.Scrollbar(
-            self.feedback_card, orient="vertical", command=self.feedback_canvas.yview
-        )
-        self.feedback_scrollbar.grid(row=1, column=1, sticky="ns")
-        self.feedback_canvas.configure(yscrollcommand=self.feedback_scrollbar.set)
-
-        self.feedback_body = ttk.Frame(self.feedback_canvas)
+        # Simplified feedback body (no nested canvas - outer ScrollableFrame handles scrolling)
+        self.feedback_body = ttk.Frame(self.feedback_card)
+        self.feedback_body.grid(row=1, column=0, sticky="nsew")
         self.feedback_body.columnconfigure(0, weight=1)
-        self.feedback_body_window = self.feedback_canvas.create_window(
-            (0, 0), window=self.feedback_body, anchor="nw"
-        )
-
-        def _sync_scroll_region(_: tk.Event) -> None:
-            self.feedback_canvas.configure(scrollregion=self.feedback_canvas.bbox("all"))
-
-        self.feedback_body.bind("<Configure>", _sync_scroll_region)
-        self.feedback_canvas.bind("<Configure>", self._on_feedback_canvas_resize)
 
         self.feedback_label = ttk.Label(
             self.feedback_body,
             text="",
-            wraplength=900,
+            wraplength=600,
             justify="left",
             anchor="w",
             foreground="#d0d0d0",
@@ -1178,7 +1227,7 @@ class LessonCardView(ttk.Frame):
         self.vocab_expansion_label = ttk.Label(
             self.feedback_body,
             text="",
-            wraplength=900,
+            wraplength=600,
             justify="left",
             anchor="w",
             font=("Helvetica", 14, "bold"),
@@ -1200,7 +1249,7 @@ class LessonCardView(ttk.Frame):
         self.feedback_spinner.grid_remove()
 
         # Responsive wrapping for question/feedback text
-        self.content.bind("<Configure>", self._update_wraplengths)
+        self.scrollable.canvas.bind("<Configure>", self._update_wraplengths)
 
     def _reset_feedback_state(self) -> None:
         """Hide feedback card/spinner and reset labels."""
@@ -1212,8 +1261,6 @@ class LessonCardView(ttk.Frame):
         self.vocab_expansion_label.configure(text="")
         self.vocab_expansion_label.grid_remove()
         self.continue_button.configure(text="Continue", command=self._on_continue_after_feedback)
-        if hasattr(self, "feedback_canvas"):
-            self.feedback_canvas.yview_moveto(0)
 
     def show_loading(self, message: str = "Loading...") -> None:
         """Show the loading spinner."""
@@ -1237,23 +1284,12 @@ class LessonCardView(ttk.Frame):
 
     def _update_wraplengths(self, event: Optional[tk.Event] = None) -> None:
         """Adjust wraplengths dynamically based on available width."""
-        if event and event.widget is not self.content:
-            return
-        width = self.content.winfo_width() or self.winfo_width()
-        primary_wrap = max(320, width - 80)
-        card_width = self.feedback_card.winfo_width() or width
-        feedback_wrap = max(260, card_width - 60)
-        self.subtitle_label.configure(wraplength=primary_wrap)
-        self.question_label.configure(wraplength=primary_wrap)
-        self.feedback_label.configure(wraplength=feedback_wrap)
-        self.vocab_expansion_label.configure(wraplength=feedback_wrap)
-
-    def _on_feedback_canvas_resize(self, event: tk.Event) -> None:
-        """Ensure the feedback body fills the available width."""
-        if hasattr(self, "feedback_body_window"):
-            self.feedback_canvas.itemconfigure(self.feedback_body_window, width=event.width)
-        # Recompute wrap lengths with the new width
-        self._update_wraplengths()
+        width = self.scrollable.canvas.winfo_width() or self.winfo_width()
+        wrap = max(200, width - 60)
+        self.subtitle_label.configure(wraplength=wrap)
+        self.question_label.configure(wraplength=wrap)
+        self.feedback_label.configure(wraplength=wrap)
+        self.vocab_expansion_label.configure(wraplength=wrap)
 
     def show_card_index(self, index: int) -> None:
         """Show a specific lesson card by index."""
@@ -1278,6 +1314,9 @@ class LessonCardView(ttk.Frame):
         else:
             self.next_button.configure(text="Submit Answer", command=self._on_next_clicked)
         self.submit_button = self.next_button
+        
+        # Scroll to top when showing new card
+        self.scrollable.scroll_to_top()
 
     def _render_card(self, card: LessonCard) -> None:
         """Render a structured lesson card."""
@@ -1443,19 +1482,11 @@ class LessonCardView(ttk.Frame):
             if not hasattr(self.controller, 'current_lesson_photo'):
                 self.controller.current_lesson_photo = photo
             self.controller.current_lesson_photo = photo
-            if not hasattr(self, 'image_label'):
-                self.image_label = ttk.Label(self.content)
-                self.image_label.grid(row=6, column=0, padx=20, pady=(0, 10))
             self.image_label.configure(image=photo, text="")
             self.image_label.grid()
-            self.controller.adjust_window_to_content(self.content)
         except Exception:
-            if not hasattr(self, 'image_label'):
-                self.image_label = ttk.Label(self.content)
-                self.image_label.grid(row=6, column=0, padx=20, pady=(0, 10))
             self.image_label.configure(text="[Could not display image]", image="")
             self.image_label.grid()
-            self.controller.adjust_window_to_content(self.content)
     
     
     def update_image_if_needed(self, image_prompt: str, image_path: str) -> None:
@@ -1574,19 +1605,16 @@ class SummaryCard(ttk.Frame):
         super().__init__(parent)
         self.controller = controller
 
-        # Center content in window - add side spacers
-        self.columnconfigure(0, weight=1)  # Left spacer
-        self.columnconfigure(2, weight=1)  # Right spacer
-        self.rowconfigure(0, weight=1)  # Top spacer
-        self.rowconfigure(2, weight=1)  # Bottom spacer
+        # Use scrollable frame for content
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
         
-        # Content wrapper - max width, centered
-        content_frame = ttk.Frame(self)
-        content_frame.grid(row=1, column=1, sticky="nsew")
-        self.content = content_frame
-        content_frame.columnconfigure(0, weight=1)
-        content_frame.rowconfigure(0, weight=1)
-        content_frame.rowconfigure(4, weight=1)
+        self.scrollable = ScrollableFrame(self)
+        self.scrollable.grid(row=0, column=0, sticky="nsew")
+        self.content = self.scrollable.content
+        
+        # Configure content to center widgets
+        self.content.columnconfigure(0, weight=1)
 
         title = ttk.Label(
             self.content,
@@ -1594,25 +1622,25 @@ class SummaryCard(ttk.Frame):
             font=("Helvetica", 28, "bold"),
             foreground="#ffffff",  # White text on dark background
         )
-        title.grid(row=1, column=0, pady=(30, 15))
+        title.grid(row=0, column=0, pady=(30, 15))
 
         # Loading spinner
         self.loading_spinner = LoadingSpinner(self.content, text="Generating summary...")
-        self.loading_spinner.grid(row=2, column=0, pady=(40, 40))
+        self.loading_spinner.grid(row=1, column=0, pady=(40, 40))
 
         self.summary_label = ttk.Label(
             self.content, 
             text="", 
-            wraplength=900, 
+            wraplength=600, 
             justify="center",
             font=("Helvetica", 14),
             foreground="#d0d0d0",  # Light gray text on dark background
         )
-        self.summary_label.grid(row=2, column=0, padx=50, pady=(0, 30), sticky="ew")
-        self.content.bind("<Configure>", self._on_summary_resize)
+        self.summary_label.grid(row=1, column=0, padx=30, pady=(0, 30), sticky="ew")
+        self.scrollable.canvas.bind("<Configure>", self._on_summary_resize)
 
         button_frame = ttk.Frame(self.content)
-        button_frame.grid(row=3, column=0, pady=(10, 30))
+        button_frame.grid(row=2, column=0, pady=(10, 50))
 
         again_button = ttk.Button(
             button_frame,
@@ -1630,9 +1658,7 @@ class SummaryCard(ttk.Frame):
 
     def _on_summary_resize(self, event: tk.Event) -> None:
         """Adjust wraplength for summary when window resizes."""
-        if event.widget is not self.content:
-            return
-        wrap = max(320, event.width - 120)
+        wrap = max(200, event.width - 60)
         self.summary_label.configure(wraplength=wrap)
     
     def show_loading(self, message: str = "Loading...") -> None:
@@ -1655,6 +1681,7 @@ class SummaryCard(ttk.Frame):
     def set_summary(self, summary: Dict[str, Any], lesson_plan: Optional[LessonPlan] = None) -> None:
         """Set summary from final summary dict."""
         self.hide_loading()
+        self.scrollable.scroll_to_top()
         
         if not summary:
             text = "No summary is available for this session."
