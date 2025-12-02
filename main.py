@@ -29,6 +29,7 @@ from typing import Optional, List, Dict, Any, Set
 
 from PIL import Image, ImageTk
 
+from core.logger import logger
 from core.api import (
     SUPPORTED_LANGUAGES,
     generate_assessment_cards,
@@ -43,6 +44,9 @@ from core.api import (
 from core.models import (
     AssessmentCard, AssessmentResult, LessonPlan, LessonCard
 )
+
+# Log application startup
+logger.banner("GAIT Language Buddy - Starting Application")
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +113,7 @@ class LoadingSpinner(ttk.Frame):
 class LanguageBuddyApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        logger.ui("Initializing LanguageBuddyApp window...")
 
         self.title("GAIT Language Buddy")
         
@@ -180,11 +185,14 @@ class LanguageBuddyApp(tk.Tk):
 
         self.cards = {}
 
+        logger.ui("Creating card views...")
         for CardClass in (IntroCard, AssessmentCardView, LessonCardView, SummaryCard):
             card = CardClass(parent=container, controller=self)
             self.cards[CardClass.__name__] = card
             card.grid(row=0, column=0, sticky="nsew")
+            logger.debug(f"  Created: {CardClass.__name__}")
 
+        logger.ui("Application initialized successfully")
         self.show_card("IntroCard")
 
     def adjust_window_to_content(self, content_widget: ttk.Frame, padding: int = 120) -> None:
@@ -209,6 +217,7 @@ class LanguageBuddyApp(tk.Tk):
     # Card management -------------------------------------------------------
 
     def show_card(self, name: str) -> None:
+        logger.ui_transition("current_card", name)
         card = self.cards[name]
         card.tkraise()
 
@@ -216,6 +225,9 @@ class LanguageBuddyApp(tk.Tk):
 
     def start_session(self, language: str) -> None:
         """Triggered from Intro card when user picks a language."""
+        logger.separator(f"Starting New Session - {language}")
+        logger.ui(f"User selected language: {language}")
+        
         self.selected_language = language
         self.assessment_cards = []
         self.assessment_stage = 0
@@ -232,48 +244,61 @@ class LanguageBuddyApp(tk.Tk):
 
         # Run API calls in a background thread
         def generate_assessment_threaded():
+            logger.task_start("generate_assessment_threaded")
             try:
                 # Generate all assessment cards (fast text-only call)
                 assessment_cards = generate_assessment_cards(language)
+                logger.task_complete("generate_assessment_threaded")
 
                 # Show questions ASAP; images are fetched per-card on demand
                 self.after(0, lambda: self._on_assessment_generated(assessment_cards))
 
             except Exception as e:
+                logger.task_error("generate_assessment_threaded", str(e))
                 # Show error in main thread
                 self.after(0, lambda: self._on_assessment_error(str(e)))
 
         thread = threading.Thread(target=generate_assessment_threaded, daemon=True)
         thread.start()
+        logger.task("Spawned background thread for assessment generation")
 
 
     def _on_assessment_image_generated(self, image_prompt: str, image_path: Optional[str]) -> None:
         """Called when an assessment image is generated (in main thread)."""
         if image_path:
+            logger.ui(f"Assessment image ready, caching...")
             self.image_cache[image_prompt] = image_path
             # Update UI if this card is currently displayed
             assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
             assessment_card.update_image_if_needed(image_prompt, image_path)
+        else:
+            logger.warning("Assessment image generation returned None")
     
     def _on_lesson_image_generated(self, image_prompt: str, image_path: Optional[str]) -> None:
         """Called when a lesson image is generated (in main thread)."""
         if image_path:
+            logger.ui(f"Lesson image ready, caching...")
             self.image_cache[image_prompt] = image_path
             # Update UI if this card is currently displayed
             lesson_card: LessonCardView = self.cards["LessonCardView"]
             lesson_card.update_image_if_needed(image_prompt, image_path)
+        else:
+            logger.warning("Lesson image generation returned None")
 
     def _on_assessment_generated(self, assessment_cards: List[AssessmentCard]) -> None:
         """Called when assessment generation completes (in main thread)."""
+        logger.ui(f"Assessment cards received: {len(assessment_cards)} cards")
         self.assessment_cards = assessment_cards
         self.assessment_stage = 1
         
         assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
         assessment_card.hide_loading()
+        logger.ui("Showing assessment stage 1")
         assessment_card.show_stage(1, assessment_cards[0])
 
     def _on_assessment_error(self, error: str) -> None:
         """Called when assessment generation fails (in main thread)."""
+        logger.error(f"Assessment generation error: {error}")
         assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
         assessment_card.hide_loading()
         messagebox.showerror("Assessment Error", f"Failed to generate assessment: {error}\n\nReturning to intro screen.")
@@ -282,12 +307,16 @@ class LanguageBuddyApp(tk.Tk):
     def request_assessment_image(self, image_prompt: Optional[str]) -> None:
         """Kick off generation for a specific assessment image if needed."""
         if not image_prompt:
+            logger.debug("No image prompt provided, skipping image request")
             return
         if image_prompt in self.image_cache:
+            logger.debug("Image already in cache, skipping request")
             return
         if image_prompt in self.pending_assessment_images:
+            logger.debug("Image already pending, skipping duplicate request")
             return
 
+        logger.ui("Requesting assessment image generation...")
         self.pending_assessment_images.add(image_prompt)
 
         def _on_image_ready(path: Optional[str]) -> None:
@@ -300,7 +329,10 @@ class LanguageBuddyApp(tk.Tk):
 
     def submit_assessment_response(self, stage: int, response: str, answer_index: Optional[int] = None) -> None:
         """Called by AssessmentCardView when user submits an assessment response."""
+        logger.ui(f"Assessment response submitted for stage {stage}")
+        
         if stage < 1 or stage > 3 or stage > len(self.assessment_cards):
+            logger.warning(f"Invalid stage number: {stage}")
             return
         
         # Store response (serialize card to dict, not LessonCard object)
@@ -317,27 +349,31 @@ class LanguageBuddyApp(tk.Tk):
             "options": card.options,
             "correct_index": card.correct_index,
         })
+        logger.debug(f"Stored response for stage {stage}, total responses: {len(self.assessment_responses)}")
         
         # Move to next stage or evaluate
         if stage < 3:
             self.assessment_stage = stage + 1
+            logger.ui(f"Moving to assessment stage {stage + 1}")
             assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
             assessment_card.show_stage(stage + 1, self.assessment_cards[stage])
         else:
             # All assessments done - evaluate and generate lesson plan
+            logger.ui("All assessments complete, generating lesson plan...")
             assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
             assessment_card.show_loading("Evaluating your responses and generating personalized lessons...")
             
             def evaluate_and_generate_lesson():
-                import sys
+                logger.task_start("evaluate_and_generate_lesson")
                 try:
                     # OPTIMIZED: Combine assessment evaluation + lesson generation into ONE API call
-                    print("[UI] Starting lesson generation...", file=sys.stdout, flush=True)
+                    logger.ui("Starting lesson generation...")
                     assessment_result, lesson_plan = generate_lesson_plan_from_assessment_responses(
                         self.assessment_responses,
                         self.selected_language or "Spanish"
                     )
-                    print("[UI] Lesson plan generated, switching to lesson view...", file=sys.stdout, flush=True)
+                    logger.task_complete("evaluate_and_generate_lesson")
+                    logger.ui("Lesson plan generated, switching to lesson view...")
                     
                     # Show first lesson immediately - don't wait for images
                     self.after(0, lambda: self._on_lesson_plan_generated(assessment_result, lesson_plan))
@@ -351,21 +387,25 @@ class LanguageBuddyApp(tk.Tk):
                     
                     # Generate all images in parallel using optimized function
                     if image_prompts_to_generate:
-                        print(f"[UI] Starting background generation of {len(image_prompts_to_generate)} images...", file=sys.stdout, flush=True)
+                        logger.ui(f"Starting background generation of {len(image_prompts_to_generate)} lesson images...")
                         generate_images_parallel(
                             image_prompts_to_generate,
                             lambda prompt, path: self._on_lesson_image_generated(prompt, path)
                         )
+                    else:
+                        logger.debug("No images to generate (all cached or no image prompts)")
                 except Exception as e:
-                    print(f"[UI] Error generating lessons: {e}", file=sys.stderr, flush=True)
+                    logger.task_error("evaluate_and_generate_lesson", str(e))
                     self.after(0, lambda: self._on_lesson_generation_error(str(e)))
             
             thread = threading.Thread(target=evaluate_and_generate_lesson, daemon=True)
             thread.start()
+            logger.task("Spawned background thread for lesson generation")
 
     def _on_lesson_image_generated(self, image_prompt: str, image_path: Optional[str]) -> None:
         """Called when a lesson image is generated (in main thread)."""
         if image_path:
+            logger.ui("Lesson image ready, updating cache...")
             self.image_cache[image_prompt] = image_path
             # Update UI if this card is currently displayed
             lesson_card: LessonCardView = self.cards["LessonCardView"]
@@ -373,8 +413,11 @@ class LanguageBuddyApp(tk.Tk):
 
     def _on_lesson_plan_generated(self, assessment_result: AssessmentResult, lesson_plan: LessonPlan) -> None:
         """Called when lesson plan generation completes (in main thread)."""
-        import sys
-        print("[UI] Lesson plan received, switching to lesson view...", file=sys.stdout, flush=True)
+        logger.ui("Lesson plan received, switching to lesson view...")
+        logger.debug(f"Assessment: proficiency={assessment_result.proficiency}, "
+                    f"fluency_score={assessment_result.fluency_score}")
+        logger.debug(f"Lesson plan: {len(lesson_plan.cards)} cards, target={lesson_plan.proficiency_target}")
+        
         self.assessment_result = assessment_result
         self.lesson_plan = lesson_plan
         self.lesson_index = 0
@@ -385,13 +428,14 @@ class LanguageBuddyApp(tk.Tk):
         
         # Switch to lesson card view and show first card
         lesson_card: LessonCardView = self.cards["LessonCardView"]
-        print("[UI] Showing first lesson card...", file=sys.stdout, flush=True)
+        logger.ui("Showing first lesson card...")
         self.show_card("LessonCardView")
         lesson_card.hide_loading()
         lesson_card.show_card_index(0)
 
     def _on_lesson_generation_error(self, error: str) -> None:
         """Called when lesson generation fails (in main thread)."""
+        logger.error(f"Lesson generation error: {error}")
         assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
         assessment_card.hide_loading()
         messagebox.showerror("Lesson Generation Error", f"Failed to generate lessons: {error}\n\nReturning to intro screen.")
@@ -399,12 +443,17 @@ class LanguageBuddyApp(tk.Tk):
 
     def submit_lesson_card_response(self, response: str, answer_index: Optional[int] = None) -> None:
         """Submit response for current lesson card and get feedback."""
+        logger.ui(f"Lesson card response submitted (card {self.lesson_index + 1})")
+        
         if not self.lesson_plan or self.lesson_index >= len(self.lesson_plan.cards):
+            logger.warning("No lesson plan or invalid card index")
             return
         
         card = self.lesson_plan.cards[self.lesson_index]
         card.user_response = response
         card.user_answer_index = answer_index
+        
+        logger.debug(f"Card type: {card.type}, response length: {len(response)}")
         
         lesson_card: LessonCardView = self.cards["LessonCardView"]
         
@@ -413,9 +462,13 @@ class LanguageBuddyApp(tk.Tk):
         needs_api_call = card.type in ("text_question", "image_question", "fill_in_blank")
         
         if needs_api_call:
+            logger.ui("Showing feedback loading (API call needed)...")
             lesson_card.show_feedback_loading()
+        else:
+            logger.debug("Instant evaluation (no API call needed)")
         
         def evaluate_response():
+            logger.task_start(f"evaluate_response_card_{self.lesson_index + 1}")
             try:
                 evaluation = evaluate_card_response(
                     card,
@@ -432,14 +485,18 @@ class LanguageBuddyApp(tk.Tk):
                 if evaluation.get("vocabulary_expansion"):
                     card.vocabulary_expansion = evaluation["vocabulary_expansion"]
                 
+                logger.task_complete(f"evaluate_response_card_{self.lesson_index + 1}")
+                logger.debug(f"Evaluation: correct={card.is_correct}, score={card.card_score}")
                 self.after(0, lambda: lesson_card.show_feedback(evaluation))
             except Exception as e:
+                logger.task_error(f"evaluate_response_card_{self.lesson_index + 1}", str(e))
                 self.after(0, lambda: lesson_card.show_feedback_error(str(e)))
         
         if needs_api_call:
             # Run API call in background thread
             thread = threading.Thread(target=evaluate_response, daemon=True)
             thread.start()
+            logger.task("Spawned background thread for response evaluation")
         else:
             # Instant evaluation for multiple choice
             evaluation = evaluate_card_response(
@@ -457,25 +514,32 @@ class LanguageBuddyApp(tk.Tk):
             if evaluation.get("vocabulary_expansion"):
                 card.vocabulary_expansion = evaluation["vocabulary_expansion"]
             
+            logger.debug(f"Instant evaluation: correct={card.is_correct}, score={card.card_score}")
             lesson_card.show_feedback(evaluation)
 
     def next_lesson_card(self) -> None:
         """Move to the next lesson card or to summary when done."""
         if not self.lesson_plan:
+            logger.warning("next_lesson_card called but no lesson plan")
             return
 
         self.lesson_index += 1
+        logger.ui(f"Moving to lesson card {self.lesson_index + 1}")
+        
         if self.lesson_index >= len(self.lesson_plan.cards):
             # Done -> generate final summary and go to summary card
+            logger.ui("All lessons complete, generating final summary...")
             summary_card: SummaryCard = self.cards["SummaryCard"]
             summary_card.show_loading("Generating final summary...")
             self.show_card("SummaryCard")
             
             def generate_summary():
+                logger.task_start("generate_summary")
                 try:
                     total_score = sum(card.card_score for card in self.lesson_plan.cards)
                     average_score = total_score // len(self.lesson_plan.cards) if self.lesson_plan.cards else 0
                     self.lesson_plan.total_score = average_score
+                    logger.debug(f"Calculated scores: total={total_score}, average={average_score}")
                     
                     summary = generate_final_summary(
                         self.lesson_plan,
@@ -483,18 +547,24 @@ class LanguageBuddyApp(tk.Tk):
                         self.selected_language or "Spanish"
                     )
                     self.final_summary = summary
+                    logger.task_complete("generate_summary")
                     self.after(0, lambda: summary_card.set_summary(summary, self.lesson_plan))
                 except Exception as e:
+                    logger.task_error("generate_summary", str(e))
                     self.after(0, lambda: summary_card.show_error(str(e)))
             
             thread = threading.Thread(target=generate_summary, daemon=True)
             thread.start()
+            logger.task("Spawned background thread for summary generation")
         else:
             lesson_card: LessonCardView = self.cards["LessonCardView"]
             lesson_card.show_card_index(self.lesson_index)
 
     def restart(self) -> None:
         """Restart the whole experience from the intro."""
+        logger.separator("Restarting Application")
+        logger.ui("User requested restart, clearing all state...")
+        
         self.selected_language = None
         self.assessment_cards = []
         self.assessment_stage = 0
@@ -505,10 +575,13 @@ class LanguageBuddyApp(tk.Tk):
         self.final_summary = None
         self.image_cache.clear()
         self.image_photos.clear()
+        
+        logger.debug("State cleared, showing intro card")
 
         intro: IntroCard = self.cards["IntroCard"]
         intro.reset()
         self.show_card("IntroCard")
+        logger.success("Application restarted")
 
 
 # ---------------------------------------------------------------------------
@@ -1622,5 +1695,10 @@ class SummaryCard(ttk.Frame):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    logger.separator("Application Starting")
+    logger.info("Creating main application window...")
     app = LanguageBuddyApp()
+    logger.success("Application window created, entering main loop")
+    logger.info("Ready for user interaction")
     app.mainloop()
+    logger.separator("Application Closed")

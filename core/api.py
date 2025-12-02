@@ -19,6 +19,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from typing import List, Optional, Callable, Dict, Any
 
 from dotenv import load_dotenv
@@ -29,20 +30,42 @@ from .models import (
     AssessmentResult, AssessmentCard
 )
 from .schemas import LESSON_CARD_SCHEMA, ASSESSMENT_CARD_SCHEMA
+from .logger import logger, Timer
 
 # ---------------------------------------------------------------------------
 # Environment & OpenAI client setup
 # ---------------------------------------------------------------------------
 
-load_dotenv()
+logger.separator("GAIT Language Buddy - API Module Initialization")
+
+logger.env("Loading environment variables from .env file...")
+dotenv_result = load_dotenv()
+if dotenv_result:
+    logger.env_success("dotenv file loaded successfully")
+else:
+    logger.warning("No .env file found or file is empty")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+if OPENAI_API_KEY:
+    # Mask the API key for logging (show first 8 and last 4 chars)
+    masked_key = f"{OPENAI_API_KEY[:8]}...{OPENAI_API_KEY[-4:]}" if len(OPENAI_API_KEY) > 12 else "***"
+    logger.env_success(f"OPENAI_API_KEY found: {masked_key}")
+    logger.env("Initializing OpenAI client...")
+    client: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY)
+    logger.env_success("OpenAI client initialized successfully")
+else:
+    logger.env_error("OPENAI_API_KEY not found in environment!")
+    logger.warning("API calls will use fallback responses (no actual AI generation)")
+    client = None
 
 # Choose a fast-ish model
 DEFAULT_CHAT_MODEL = "gpt-4o-mini"
 # Use DALL-E 3 with standard quality for lowest latency
 DEFAULT_IMAGE_MODEL = "dall-e-3"
+
+logger.env(f"Default chat model: {DEFAULT_CHAT_MODEL}")
+logger.env(f"Default image model: {DEFAULT_IMAGE_MODEL}")
 
 SUPPORTED_LANGUAGES = [
     "Spanish",
@@ -52,6 +75,9 @@ SUPPORTED_LANGUAGES = [
     "Chinese",
     # English intentionally omitted (UI is in English)
 ]
+
+logger.env(f"Supported languages: {', '.join(SUPPORTED_LANGUAGES)}")
+logger.separator("API Module Ready")
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +91,10 @@ def generate_scene(language: str) -> SceneInfo:
     Returns a SceneInfo object. If the API is unavailable, a reasonable
     fallback scene is created.
     """
+    logger.api(f"generate_scene() called for language: {language}")
+    
     if client is None:
+        logger.warning("OpenAI client not available, using fallback scene")
         # Fallback: static description + simple prompt
         scene_description = (
             "A busy city square in the early evening. There is a large fountain in the center, "
@@ -104,22 +133,29 @@ def generate_scene(language: str) -> SceneInfo:
             },
         ]
 
-        completion = client.chat.completions.create(
-            model=DEFAULT_CHAT_MODEL,
-            response_format={"type": "json_object"},
-            messages=messages,
-            temperature=0.5,
-        )
+        logger.api_call("chat.completions.create", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.5,
+            )
+        logger.api_response("chat.completions.create", duration_ms=timer.duration_ms)
+        
         raw = completion.choices[0].message.content
         data = json.loads(raw)
-
-        return SceneInfo(
+        
+        scene = SceneInfo(
             language=language,
             scene_description=data.get("scene_description", "").strip(),
             image_prompt=data.get("image_prompt", "").strip(),
         )
+        logger.success(f"Scene generated: {scene.image_prompt[:50]}...")
+        return scene
 
-    except Exception:
+    except Exception as e:
+        logger.api_error(f"Scene generation failed: {e}", exc_info=True)
         # Fall back to a static scene on any error
         scene_description = (
             "A busy city square in the early evening. There is a large fountain in the center, "
@@ -144,25 +180,36 @@ def generate_images_parallel(
     Calls callback(image_prompt, image_path) for each completed image.
     This is much faster than sequential generation - all images start generating simultaneously.
     """
-    import sys
-    
     total = len(image_prompts)
-    if total > 0:
-        print(f"[API] Starting generation of {total} images in parallel...", file=sys.stdout, flush=True)
+    if total == 0:
+        logger.img("No images to generate")
+        return
+    
+    logger.img(f"Starting parallel generation of {total} images")
+    logger.task_start(f"parallel_image_generation ({total} images)")
+    
+    completed_count = [0]  # Use list for mutable counter in closure
     
     def _generate_single(prompt: str, index: int):
-        print(f"[API] Generating image {index + 1}/{total}...", file=sys.stdout, flush=True)
+        logger.img(f"[{index + 1}/{total}] Starting generation...")
+        start_time = time.perf_counter()
+        
         path = generate_scene_image(prompt)
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        
+        completed_count[0] += 1
         if path:
-            print(f"[API] Image {index + 1}/{total} generated successfully", file=sys.stdout, flush=True)
+            logger.img(f"[{index + 1}/{total}] ✓ Complete ({duration_ms:.0f}ms) - {completed_count[0]}/{total} done")
         else:
-            print(f"[API] Image {index + 1}/{total} generation failed", file=sys.stdout, flush=True)
+            logger.img_error(f"[{index + 1}/{total}] ✗ Failed ({duration_ms:.0f}ms)")
+        
         callback(prompt, path)
     
     # Start all image generations in parallel immediately
     for i, prompt in enumerate(image_prompts):
         thread = threading.Thread(target=lambda p=prompt, idx=i: _generate_single(p, idx), daemon=True)
         thread.start()
+        logger.task(f"Spawned thread for image {i + 1}/{total}")
 
 
 def generate_image_async(
@@ -173,8 +220,18 @@ def generate_image_async(
     Generate an image asynchronously in a background thread.
     Calls callback with the image path when done, or None on error.
     """
+    logger.task_start("async_image_generation")
+    
     def _generate():
+        start_time = time.perf_counter()
         path = generate_scene_image(image_prompt)
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        
+        if path:
+            logger.task_complete("async_image_generation", duration_ms=duration_ms)
+        else:
+            logger.task_error("async_image_generation", "Image generation returned None")
+        
         callback(path)
     
     thread = threading.Thread(target=_generate, daemon=True)
@@ -187,6 +244,7 @@ def sanitize_image_prompt(prompt: str) -> str:
     Removes or replaces potentially problematic terms.
     """
     if not prompt:
+        logger.debug("Empty prompt, using default")
         return "a simple educational illustration"
     
     # Convert to lowercase for checking
@@ -210,11 +268,16 @@ def sanitize_image_prompt(prompt: str) -> str:
     }
     
     sanitized = prompt
+    replaced_words = []
     for word, replacement in replacements.items():
         if word in prompt_lower:
             # Replace word boundaries only
             import re
             sanitized = re.sub(r'\b' + re.escape(word) + r'\b', replacement, sanitized, flags=re.IGNORECASE)
+            replaced_words.append(f"{word}->{replacement}")
+    
+    if replaced_words:
+        logger.debug(f"Sanitized prompt: {', '.join(replaced_words)}")
     
     # Ensure prompt is educational and appropriate
     if not any(word in prompt_lower for word in ["educational", "learning", "simple", "illustration", "drawing", "picture"]):
@@ -223,6 +286,7 @@ def sanitize_image_prompt(prompt: str) -> str:
     # Limit length to avoid overly complex prompts
     if len(sanitized) > 200:
         sanitized = sanitized[:200] + "..."
+        logger.debug("Truncated prompt to 200 chars")
     
     return sanitized.strip()
 
@@ -238,62 +302,75 @@ def generate_scene_image(image_prompt: str) -> Optional[str]:
         or the client is not configured.
     """
     if client is None:
+        logger.warning("OpenAI client not available, skipping image generation")
         return None
 
     # Sanitize the prompt first
     sanitized_prompt = sanitize_image_prompt(image_prompt)
+    logger.img_start(sanitized_prompt)
     
     try:
-        result = client.images.generate(
-            model=DEFAULT_IMAGE_MODEL,
-            prompt=sanitized_prompt,
-            size="1024x1024",  # Standard size for DALL-E 3
-            quality="standard",  # Use "standard" instead of "hd" for lower latency
-            response_format="b64_json",  # Request base64 encoded image
-            # Note: DALL-E 3 only generates 1 image, so n parameter is not supported
-        )
+        logger.api_call("images.generate", model=DEFAULT_IMAGE_MODEL)
+        with Timer() as timer:
+            result = client.images.generate(
+                model=DEFAULT_IMAGE_MODEL,
+                prompt=sanitized_prompt,
+                size="1024x1024",  # Standard size for DALL-E 3
+                quality="standard",  # Use "standard" instead of "hd" for lower latency
+                response_format="b64_json",  # Request base64 encoded image
+                # Note: DALL-E 3 only generates 1 image, so n parameter is not supported
+            )
+        logger.api_response("images.generate", duration_ms=timer.duration_ms)
         
         # Extract base64 data from response
         image_data = result.data[0]
         if not hasattr(image_data, 'b64_json') or not image_data.b64_json:
+            logger.img_error("Response missing b64_json data")
             return None
             
         image_bytes = base64.b64decode(image_data.b64_json)
+        logger.debug(f"Decoded image: {len(image_bytes)} bytes")
 
         fd, path = tempfile.mkstemp(suffix=".png", prefix="gait_scene_")
         with os.fdopen(fd, "wb") as f:
             f.write(image_bytes)
 
+        logger.img_complete(path, duration_ms=timer.duration_ms)
         return path
+        
     except Exception as e:
         # Check if it's a content policy violation
         error_str = str(e)
         if "content_policy" in error_str or "safety" in error_str.lower():
-            # Try with a completely safe generic prompt
-            import sys
-            print(f"Image generation blocked for prompt, using safe alternative: {image_prompt}", file=sys.stderr)
+            logger.warning(f"Content policy violation, trying safe fallback prompt")
+            logger.debug(f"Blocked prompt: {image_prompt[:100]}...")
+            
             try:
-                safe_prompt = f"a simple educational illustration suitable for language learning"
-                result = client.images.generate(
-                    model=DEFAULT_IMAGE_MODEL,
-                    prompt=safe_prompt,
-                    size="1024x1024",
-                    quality="standard",
-                    response_format="b64_json",
-                )
+                safe_prompt = "a simple educational illustration suitable for language learning"
+                logger.api_call("images.generate (fallback)", model=DEFAULT_IMAGE_MODEL)
+                
+                with Timer() as timer:
+                    result = client.images.generate(
+                        model=DEFAULT_IMAGE_MODEL,
+                        prompt=safe_prompt,
+                        size="1024x1024",
+                        quality="standard",
+                        response_format="b64_json",
+                    )
+                logger.api_response("images.generate (fallback)", duration_ms=timer.duration_ms)
+                
                 image_data = result.data[0]
                 if hasattr(image_data, 'b64_json') and image_data.b64_json:
                     image_bytes = base64.b64decode(image_data.b64_json)
                     fd, path = tempfile.mkstemp(suffix=".png", prefix="gait_scene_")
                     with os.fdopen(fd, "wb") as f:
                         f.write(image_bytes)
+                    logger.img_complete(path, duration_ms=timer.duration_ms)
                     return path
-            except Exception:
-                pass
+            except Exception as fallback_error:
+                logger.img_error(f"Fallback generation also failed: {fallback_error}")
         
-        # Log the error for debugging
-        import sys
-        print(f"Image generation error: {e}", file=sys.stderr)
+        logger.img_error(f"Image generation failed: {e}")
         return None
 
 
@@ -350,7 +427,11 @@ def evaluate_user_text(text: str, language: str, scene_description: str) -> Text
     Returns a TextAnalysis object with proficiency, strengths,
     weaknesses, suggestions, and a 0–100 score.
     """
+    logger.api(f"evaluate_user_text() called for {language}")
+    logger.debug(f"Learner text length: {len(text)} chars")
+    
     if client is None:
+        logger.warning("Using fallback evaluation (no API)")
         return _evaluate_user_text_fallback(text, language, scene_description)
 
     try:
@@ -385,25 +466,31 @@ def evaluate_user_text(text: str, language: str, scene_description: str) -> Text
             },
         ]
 
-        completion = client.chat.completions.create(
-            model=DEFAULT_CHAT_MODEL,
-            response_format={"type": "json_object"},
-            messages=messages,
-            temperature=0.3,
-        )
+        logger.api_call("chat.completions.create (evaluate_user_text)", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.3,
+            )
+        logger.api_response("chat.completions.create", duration_ms=timer.duration_ms)
 
         raw = completion.choices[0].message.content
         data = json.loads(raw)
-
-        return TextAnalysis(
+        
+        result = TextAnalysis(
             proficiency=data.get("proficiency", "A1"),
             strengths=data.get("strengths", []) or [],
             weaknesses=data.get("weaknesses", []) or [],
             suggestions=data.get("suggestions", []) or [],
             score=int(data.get("score", 0)),
         )
+        logger.success(f"Text evaluated: proficiency={result.proficiency}, score={result.score}")
+        return result
 
-    except Exception:
+    except Exception as e:
+        logger.api_error(f"Text evaluation failed: {e}", exc_info=True)
         return _evaluate_user_text_fallback(text, language, scene_description)
 
 
@@ -510,8 +597,11 @@ def generate_assessment_cards(language: str) -> List[AssessmentCard]:
     Returns a list of 3 AssessmentCard objects with different question types
     to assess vocabulary, grammar, and comprehension.
     """
+    logger.separator(f"Generating Assessment Cards for {language}")
+    logger.api(f"generate_assessment_cards() called for language: {language}")
+    
     if client is None:
-        # Fallback assessment cards
+        logger.warning("Using fallback assessment cards (no API)")
         return _assessment_cards_fallback(language)
     
     try:
@@ -576,35 +666,42 @@ def generate_assessment_cards(language: str) -> List[AssessmentCard]:
             },
         ]
         
-        completion = client.chat.completions.create(
-            model=DEFAULT_CHAT_MODEL,
-            response_format={"type": "json_object"},
-            messages=messages,
-            temperature=0.9,  # Higher temperature for more variety/randomness in assessment content
-        )
+        logger.api_call("chat.completions.create (assessment)", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.9,  # Higher temperature for more variety/randomness in assessment content
+            )
+        logger.api_response("chat.completions.create", duration_ms=timer.duration_ms)
         
         raw = completion.choices[0].message.content
         data = json.loads(raw)
         card_data_list = data.get("assessment_cards", [])
         
+        logger.debug(f"Received {len(card_data_list)} assessment cards from API")
+        
         if len(card_data_list) < 3:
+            logger.warning(f"Only {len(card_data_list)} cards received, using fallback")
             return _assessment_cards_fallback(language)
         
         # Convert JSON to AssessmentCard objects
         assessment_cards = []
-        for card_data in card_data_list[:3]:
+        for i, card_data in enumerate(card_data_list[:3], 1):
             lesson_card = _json_to_lesson_card(card_data)
             assessment_card = AssessmentCard(
-                stage=card_data.get("stage", 1),
+                stage=card_data.get("stage", i),
                 card=lesson_card
             )
             assessment_cards.append(assessment_card)
+            logger.debug(f"Assessment card {i}: type={lesson_card.type}, has_image={bool(lesson_card.image_prompt)}")
         
+        logger.success(f"Generated {len(assessment_cards)} assessment cards successfully")
         return assessment_cards
     
     except Exception as e:
-        import sys
-        print(f"Assessment generation error: {e}", file=sys.stderr)
+        logger.api_error(f"Assessment generation failed: {e}", exc_info=True)
         return _assessment_cards_fallback(language)
 
 
@@ -792,13 +889,17 @@ def generate_lesson_plan_from_assessment_responses(
     Returns:
         Tuple of (AssessmentResult, LessonPlan)
     """
+    logger.separator(f"Generating Lesson Plan from Assessment ({language})")
+    logger.api("generate_lesson_plan_from_assessment_responses() called")
+    logger.debug(f"Processing {len(assessment_responses)} assessment responses")
+    
     if client is None:
+        logger.warning("Using fallback lesson plan (no API)")
         assessment_result = _assessment_result_fallback()
         return assessment_result, _structured_lesson_plan_fallback(assessment_result, language)
     
     try:
-        import sys
-        print("[API] Evaluating assessment responses and generating lesson plan...", file=sys.stdout, flush=True)
+        logger.api("Evaluating assessment responses and generating lesson plan...")
         
         messages = [
             {
@@ -881,21 +982,22 @@ def generate_lesson_plan_from_assessment_responses(
             },
         ]
         
-        print("[API] Calling OpenAI API...", file=sys.stdout, flush=True)
-        completion = client.chat.completions.create(
-            model=DEFAULT_CHAT_MODEL,
-            response_format={"type": "json_object"},
-            messages=messages,
-            temperature=0.7,
-            max_tokens=4000,  # Limit tokens for faster response (assessment + 10 lesson cards)
-        )
-        print("[API] Response received, parsing...", file=sys.stdout, flush=True)
+        logger.api_call("chat.completions.create (combined assessment+lesson)", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.7,
+                max_tokens=4000,  # Limit tokens for faster response (assessment + 10 lesson cards)
+            )
+        logger.api_response("chat.completions.create", duration_ms=timer.duration_ms)
         
         raw = completion.choices[0].message.content
         data = json.loads(raw)
         
         # Extract assessment result
-        print("[API] Extracting assessment result...", file=sys.stdout, flush=True)
+        logger.debug("Extracting assessment result from response...")
         assessment_data = data.get("assessment", {})
         assessment_result = AssessmentResult(
             proficiency=assessment_data.get("proficiency", "A1"),
@@ -906,30 +1008,34 @@ def generate_lesson_plan_from_assessment_responses(
             weaknesses=assessment_data.get("weaknesses", []) or [],
             recommendations=assessment_data.get("recommendations", []) or [],
         )
+        logger.success(f"Assessment result: proficiency={assessment_result.proficiency}, "
+                      f"fluency_score={assessment_result.fluency_score}")
         
         # Extract lesson cards
-        print("[API] Processing lesson cards...", file=sys.stdout, flush=True)
+        logger.debug("Processing lesson cards...")
         card_data_list = data.get("lesson_cards", []) or []
         if not card_data_list:
-            print("[API] No lesson cards in response, using fallback", file=sys.stdout, flush=True)
+            logger.warning("No lesson cards in response, using fallback")
             lesson_plan = _structured_lesson_plan_fallback(assessment_result, language)
         else:
             cards = []
             for i, card_data in enumerate(card_data_list[:10], 1):
                 cards.append(_json_to_lesson_card(card_data))
-                if i % 3 == 0:
-                    print(f"[API] Processed {i}/{min(10, len(card_data_list))} lesson cards...", file=sys.stdout, flush=True)
+            logger.debug(f"Processed {len(cards)} lesson cards")
+            
             lesson_plan = LessonPlan(
                 cards=cards,
                 proficiency_target=assessment_result.proficiency
             )
         
-        print("[API] Assessment and lesson plan generation complete!", file=sys.stdout, flush=True)
+        # Count cards with images
+        cards_with_images = sum(1 for c in lesson_plan.cards if c.image_prompt)
+        logger.success(f"Lesson plan generated: {len(lesson_plan.cards)} cards, "
+                      f"{cards_with_images} with images")
         return assessment_result, lesson_plan
     
     except Exception as e:
-        import sys
-        print(f"Combined assessment+lesson generation error: {e}", file=sys.stderr)
+        logger.api_error(f"Combined assessment+lesson generation failed: {e}", exc_info=True)
         assessment_result = _assessment_result_fallback()
         return assessment_result, _structured_lesson_plan_fallback(assessment_result, language)
 
@@ -944,7 +1050,10 @@ def generate_structured_lesson_plan(
     Uses structured JSON format to create varied lesson cards including
     multiple choice, fill-in-blank, image questions, etc.
     """
+    logger.api(f"generate_structured_lesson_plan() for {language}, proficiency={assessment_result.proficiency}")
+    
     if client is None:
+        logger.warning("Using fallback lesson plan (no API)")
         return _structured_lesson_plan_fallback(assessment_result, language)
     
     try:
@@ -1008,19 +1117,23 @@ def generate_structured_lesson_plan(
             },
         ]
         
-        completion = client.chat.completions.create(
-            model=DEFAULT_CHAT_MODEL,
-            response_format={"type": "json_object"},
-            messages=messages,
-            temperature=0.7,  # Lower temp for faster, more consistent responses
-            max_tokens=4000,  # Limit tokens for faster response
-        )
+        logger.api_call("chat.completions.create (structured_lesson)", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.7,  # Lower temp for faster, more consistent responses
+                max_tokens=4000,  # Limit tokens for faster response
+            )
+        logger.api_response("chat.completions.create", duration_ms=timer.duration_ms)
         
         raw = completion.choices[0].message.content
         data = json.loads(raw)
         card_data_list = data.get("lesson_cards", []) or []
         
         if not card_data_list:
+            logger.warning("No lesson cards in response, using fallback")
             return _structured_lesson_plan_fallback(assessment_result, language)
         
         # Convert JSON to LessonCard objects
@@ -1028,14 +1141,14 @@ def generate_structured_lesson_plan(
         for card_data in card_data_list[:10]:
             cards.append(_json_to_lesson_card(card_data))
         
+        logger.success(f"Generated {len(cards)} lesson cards")
         return LessonPlan(
             cards=cards,
             proficiency_target=assessment_result.proficiency
         )
     
     except Exception as e:
-        import sys
-        print(f"Lesson plan generation error: {e}", file=sys.stderr)
+        logger.api_error(f"Lesson plan generation failed: {e}", exc_info=True)
         return _structured_lesson_plan_fallback(assessment_result, language)
 
 
@@ -1114,10 +1227,14 @@ def evaluate_card_response(
     - alternatives: List[str]
     - vocabulary_expansion: List[str]
     """
+    logger.api(f"evaluate_card_response() - type={card.type}")
+    
     # Multiple choice: instant evaluation (no API call)
     if card.type == "multiple_choice" and user_answer_index is not None:
         is_correct = (user_answer_index == card.correct_index)
         card_score = 100 if is_correct else 0
+        
+        logger.debug(f"Multiple choice evaluation (no API): correct={is_correct}, score={card_score}")
         
         return {
             "is_correct": is_correct,
@@ -1130,9 +1247,11 @@ def evaluate_card_response(
     
     # For text-based/freeform responses, use API call for accurate evaluation
     if card.type in ("text_question", "image_question", "fill_in_blank") and user_response:
+        logger.debug(f"Text response evaluation (API required), response length: {len(user_response)}")
         return _evaluate_text_response_with_api(card, user_response, language)
     
     # Fallback for other types
+    logger.debug("Using fallback evaluation (no response or unknown type)")
     return {
         "is_correct": False,
         "card_score": 0,
@@ -1153,6 +1272,7 @@ def _evaluate_text_response_with_api(
     Includes image prompt and question context for accurate evaluation.
     """
     if not client:
+        logger.warning("Using fallback evaluation (no API)")
         return _evaluate_card_response_fallback(card, user_response, None)
     
     try:
@@ -1201,18 +1321,21 @@ def _evaluate_text_response_with_api(
             },
         ]
         
-        completion = client.chat.completions.create(
-            model=DEFAULT_CHAT_MODEL,  # gpt-4o-mini for lowest latency
-            response_format={"type": "json_object"},
-            messages=messages,
-            temperature=0.3,
-            max_tokens=500,  # Limit for faster response
-        )
+        logger.api_call("chat.completions.create (evaluate_text)", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,  # gpt-4o-mini for lowest latency
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.3,
+                max_tokens=500,  # Limit for faster response
+            )
+        logger.api_response("chat.completions.create", duration_ms=timer.duration_ms)
         
         raw = completion.choices[0].message.content
         data = json.loads(raw)
         
-        return {
+        result = {
             "is_correct": data.get("is_correct", False),
             "card_score": int(data.get("card_score", 0)),
             "feedback": data.get("feedback", card.feedback or "Thank you for your response."),
@@ -1220,10 +1343,12 @@ def _evaluate_text_response_with_api(
             "alternatives": data.get("alternatives", card.alternatives or []) or [],
             "vocabulary_expansion": data.get("vocabulary_expansion", card.vocabulary_expansion or []) or [],
         }
+        
+        logger.success(f"Text evaluation: correct={result['is_correct']}, score={result['card_score']}")
+        return result
     
     except Exception as e:
-        import sys
-        print(f"Text evaluation API error: {e}", file=sys.stderr)
+        logger.api_error(f"Text evaluation API error: {e}", exc_info=True)
         return _evaluate_card_response_fallback(card, user_response, None)
 
 
@@ -1264,12 +1389,17 @@ def generate_final_summary(
     - strengths: List[str]
     - areas_to_improve: List[str]
     """
+    logger.separator("Generating Final Summary")
+    logger.api(f"generate_final_summary() for {language}")
+    
     if client is None:
+        logger.warning("Using fallback summary (no API)")
         return _final_summary_fallback(lesson_plan, assessment_result)
     
     try:
         total_score = sum(card.card_score for card in lesson_plan.cards)
         average_score = total_score // len(lesson_plan.cards) if lesson_plan.cards else 0
+        logger.debug(f"Calculating summary: total_score={total_score}, avg={average_score}, cards={len(lesson_plan.cards)}")
         
         messages = [
             {
@@ -1319,27 +1449,32 @@ def generate_final_summary(
             },
         ]
         
-        completion = client.chat.completions.create(
-            model=DEFAULT_CHAT_MODEL,
-            response_format={"type": "json_object"},
-            messages=messages,
-            temperature=0.5,
-        )
+        logger.api_call("chat.completions.create (final_summary)", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.5,
+            )
+        logger.api_response("chat.completions.create", duration_ms=timer.duration_ms)
         
         raw = completion.choices[0].message.content
         data = json.loads(raw)
         
-        return {
+        result = {
             "overall_score": int(data.get("overall_score", average_score)),
             "proficiency_improvement": data.get("proficiency_improvement", "You made good progress!"),
             "study_suggestions": data.get("study_suggestions", []) or [],
             "strengths": data.get("strengths", []) or [],
             "areas_to_improve": data.get("areas_to_improve", []) or [],
         }
+        
+        logger.success(f"Summary generated: overall_score={result['overall_score']}")
+        return result
     
     except Exception as e:
-        import sys
-        print(f"Final summary generation error: {e}", file=sys.stderr)
+        logger.api_error(f"Final summary generation failed: {e}", exc_info=True)
         return _final_summary_fallback(lesson_plan, assessment_result)
 
 
