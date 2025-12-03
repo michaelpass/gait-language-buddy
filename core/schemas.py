@@ -102,9 +102,25 @@ The lesson card JSON structure supports the following card types:
    Audio comprehension uses longer passages and tests understanding through questions.
    Questions should be in English, but answers may be in the target language.
 
+8. "speaking" - Speaking exercise where user records themselves saying a phrase
+   {
+     "type": "speaking",
+     "instruction": "Say the following phrase out loud in [target language]:",
+     "speaking_prompt": "The phrase/sentence the user should say (in target language)",
+     "correct_answer": "Same as speaking_prompt (for comparison with transcription)",
+     "alternatives": ["Acceptable variations of the phrase"],
+     "feedback": "Feedback on their speaking",
+     "vocabulary_expansion": ["Key vocabulary from the phrase"]
+   }
+   Speaking exercises use speech-to-text to transcribe the user's speech and compare
+   it to the expected phrase. This tests production of language, not just recognition.
+   Keep speaking prompts short and clear (1-2 sentences max for beginners, up to 3 for advanced).
+   Include 1-2 speaking cards per lesson to practice oral production.
+
 All cards should target the learner's proficiency level.
 Images should be used frequently to aid learning.
 Audio exercises help develop listening skills - include 2-3 audio cards per lesson.
+Speaking exercises help develop oral production - include 1-2 speaking cards per lesson.
 
 IMPORTANT: Image prompts must be safe and educational:
 - Use simple, everyday objects and scenes (e.g., "a red apple", "a friendly cat", "a sunny park")

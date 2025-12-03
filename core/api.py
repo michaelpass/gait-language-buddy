@@ -537,6 +537,211 @@ def generate_audio_for_cards(
 
 
 # ---------------------------------------------------------------------------
+# Speech-to-Text (STT) Transcription
+# ---------------------------------------------------------------------------
+
+DEFAULT_STT_MODEL = "whisper-1"
+
+logger.env(f"Default STT model: {DEFAULT_STT_MODEL}")
+
+
+def transcribe_audio(
+    audio_path: str,
+    language: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Transcribe audio to text using OpenAI's Whisper API.
+    
+    Args:
+        audio_path: Path to the audio file (mp3, wav, m4a, etc.)
+        language: Optional language hint (ISO 639-1 code, e.g., 'es', 'de', 'fr')
+    
+    Returns:
+        Transcribed text, or None on failure
+    """
+    if client is None:
+        logger.warning("OpenAI client not available, cannot transcribe audio")
+        return None
+    
+    if not audio_path:
+        logger.warning("No audio path provided for transcription")
+        return None
+    
+    # Map language names to ISO codes for Whisper
+    language_codes = {
+        "Spanish": "es",
+        "French": "fr",
+        "German": "de",
+        "Arabic": "ar",
+        "Japanese": "ja",
+        "Chinese": "zh",
+    }
+    
+    lang_code = language_codes.get(language) if language else None
+    
+    logger.api(f"transcribe_audio() - file={audio_path}, lang={lang_code}")
+    
+    try:
+        with open(audio_path, "rb") as audio_file:
+            logger.api_call("audio.transcriptions.create", model=DEFAULT_STT_MODEL)
+            
+            with Timer() as timer:
+                # Whisper API call
+                kwargs = {
+                    "model": DEFAULT_STT_MODEL,
+                    "file": audio_file,
+                    "response_format": "text",
+                }
+                if lang_code:
+                    kwargs["language"] = lang_code
+                
+                transcription = client.audio.transcriptions.create(**kwargs)
+            
+            logger.api_response("audio.transcriptions.create", duration_ms=timer.duration_ms)
+            
+            # Response is just the text when response_format="text"
+            result = transcription.strip() if isinstance(transcription, str) else str(transcription).strip()
+            logger.success(f"Transcription complete: '{result[:50]}...' ({timer.duration_ms:.0f}ms)")
+            return result
+            
+    except Exception as e:
+        logger.error(f"Transcription failed: {e}")
+        return None
+
+
+def transcribe_audio_async(
+    audio_path: str,
+    language: Optional[str],
+    callback: Callable[[Optional[str]], None],
+) -> None:
+    """
+    Transcribe audio asynchronously in a background thread.
+    Calls callback with the transcribed text when done, or None on error.
+    """
+    logger.task_start("async_transcription")
+    
+    def _transcribe():
+        start_time = time.perf_counter()
+        result = transcribe_audio(audio_path, language)
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        
+        if result:
+            logger.task_complete("async_transcription", duration_ms=duration_ms)
+        else:
+            logger.task_error("async_transcription", "Transcription returned None")
+        
+        callback(result)
+    
+    thread = threading.Thread(target=_transcribe, daemon=True)
+    thread.start()
+
+
+def evaluate_speaking_response(
+    card,
+    user_transcription: str,
+    language: str
+) -> Dict[str, Any]:
+    """
+    Evaluate a speaking exercise by comparing the user's transcription
+    to the expected speaking prompt.
+    
+    Uses LLM to assess if the user said the correct thing, accounting for
+    minor variations and acceptable alternatives.
+    """
+    logger.api(f"evaluate_speaking_response() - expected: {card.speaking_prompt[:30]}...")
+    
+    if not client:
+        # Simple fallback: compare transcriptions
+        expected = (card.speaking_prompt or "").strip().lower()
+        actual = user_transcription.strip().lower()
+        is_correct = expected == actual or actual in expected or expected in actual
+        return {
+            "is_correct": is_correct,
+            "card_score": 100 if is_correct else 50,
+            "feedback": "Good job!" if is_correct else f"Expected: {card.speaking_prompt}",
+            "correct_answer": card.speaking_prompt or "",
+            "alternatives": card.alternatives or [],
+            "vocabulary_expansion": card.vocabulary_expansion or [],
+        }
+    
+    try:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a language tutor evaluating a student's speaking exercise. "
+                    "The student was asked to say a phrase, and their speech was transcribed. "
+                    "Compare the transcription to the expected phrase. "
+                    "Be lenient with minor differences, punctuation, and small variations. "
+                    "Focus on whether the student communicated the same meaning.\n\n"
+                    "Return ONLY a JSON object:\n"
+                    "{\n"
+                    '  "is_correct": true/false (true if substantially correct),\n'
+                    '  "card_score": 0-100 (100=perfect match, 70-99=minor differences, 40-69=partial, 0-39=incorrect),\n'
+                    '  "feedback": "Constructive feedback on their speaking - in English",\n'
+                    '  "pronunciation_notes": "Any notes about what they might have mispronounced (based on transcription errors)",\n'
+                    '  "vocabulary_expansion": ["Related vocabulary words"]\n'
+                    "}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "target_language": language,
+                        "expected_phrase": card.speaking_prompt or "",
+                        "acceptable_alternatives": card.alternatives or [],
+                        "user_transcription": user_transcription,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        
+        logger.api_call("chat.completions.create (speaking evaluation)", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.3,
+                max_tokens=500,
+            )
+        logger.api_response("chat.completions.create", duration_ms=timer.duration_ms)
+        
+        raw = completion.choices[0].message.content
+        data = json.loads(raw)
+        
+        feedback = data.get("feedback", "Check your pronunciation.")
+        if data.get("pronunciation_notes"):
+            feedback += f"\n\nNote: {data.get('pronunciation_notes')}"
+        
+        return {
+            "is_correct": data.get("is_correct", False),
+            "card_score": int(data.get("card_score", 0)),
+            "feedback": feedback,
+            "correct_answer": card.speaking_prompt or "",
+            "alternatives": card.alternatives or [],
+            "vocabulary_expansion": data.get("vocabulary_expansion", []) or card.vocabulary_expansion or [],
+        }
+        
+    except Exception as e:
+        logger.error(f"Speaking evaluation failed: {e}")
+        # Fallback
+        expected = (card.speaking_prompt or "").strip().lower()
+        actual = user_transcription.strip().lower()
+        is_correct = expected == actual
+        return {
+            "is_correct": is_correct,
+            "card_score": 100 if is_correct else 50,
+            "feedback": "Good job!" if is_correct else f"Expected: {card.speaking_prompt}",
+            "correct_answer": card.speaking_prompt or "",
+            "alternatives": card.alternatives or [],
+            "vocabulary_expansion": card.vocabulary_expansion or [],
+        }
+
+
+# ---------------------------------------------------------------------------
 # Evaluation of learner text
 # ---------------------------------------------------------------------------
 
@@ -1044,6 +1249,7 @@ def _json_to_lesson_card(card_data: Dict[str, Any]) -> LessonCard:
         related_words=card_data.get("related_words", []) or [],
         audio_text=card_data.get("audio_text"),
         comprehension_questions=comprehension_questions,
+        speaking_prompt=card_data.get("speaking_prompt"),
         feedback=card_data.get("feedback"),
         vocabulary_expansion=card_data.get("vocabulary_expansion", []) or [],
     )
@@ -1118,15 +1324,16 @@ def generate_lesson_plan_from_assessment_responses(
                     '      "feedback": "...",\n'
                     '      "vocabulary_expansion": [...]\n'
                     "    },\n"
-                    "    ... (exactly 10 cards)\n"
+                    "    ... (exactly 12 cards)\n"
                     "  ]\n"
                     "}\n\n"
                     "Requirements:\n"
                     "- FIRST: Analyze assessment responses to determine proficiency level\n"
-                    "- THEN: Create exactly 10 diverse lesson cards AT that proficiency level\n"
-                    "- Use a mix of card types: multiple_choice, fill_in_blank, image_question, vocabulary, audio_transcription, audio_comprehension\n"
-                    "- Include image_prompts for visual cards (at least 5 out of 10)\n"
+                    "- THEN: Create exactly 12 diverse lesson cards AT that proficiency level\n"
+                    "- Use a mix of card types: multiple_choice, fill_in_blank, image_question, vocabulary, audio_transcription, audio_comprehension, speaking\n"
+                    "- Include image_prompts for visual cards (at least 5 out of 12)\n"
                     "- IMPORTANT: Include 2-3 AUDIO cards (audio_transcription or audio_comprehension) to develop listening skills\n"
+                    "- IMPORTANT: Include 1-2 SPEAKING cards where the user speaks a phrase and it's transcribed\n"
                     "- CRITICAL: Lesson difficulty must match the assessed proficiency level exactly\n"
                     "- Every card MUST focus on building LANGUAGE SKILLS (grammar practice, vocabulary usage, sentence construction, comprehension, speaking/writing prompts, pronunciation cues, etc.). Avoid pure trivia like geography/history unless it explicitly requires using the target language.\n"
                     "- Each card should have feedback and vocabulary_expansion\n"
@@ -1144,6 +1351,15 @@ def generate_lesson_plan_from_assessment_responses(
                     "- For beginners (A1-A2): Simple sentences, slow pacing, common vocabulary\n"
                     "- For intermediate (B1-B2): Complex sentences, natural pacing, varied vocabulary\n"
                     "- For advanced (C1-C2): Native-speed, idioms, sophisticated structures\n\n"
+                    "SPEAKING CARD REQUIREMENTS:\n"
+                    "- speaking: User records themselves saying a phrase, which is transcribed and compared\n"
+                    "  - speaking_prompt: The phrase the user should say in " + language + "\n"
+                    "  - correct_answer: Same as speaking_prompt\n"
+                    "  - instruction: 'Say the following phrase out loud:' (in English)\n"
+                    "  - alternatives: Acceptable variations of the phrase\n"
+                    "- For beginners (A1-A2): Simple greetings, numbers, basic vocabulary (1 sentence)\n"
+                    "- For intermediate (B1-B2): Common phrases, short sentences (1-2 sentences)\n"
+                    "- For advanced (C1-C2): Complex sentences, idioms (2-3 sentences)\n\n"
                     "CRITICAL LANGUAGE RULES (PROFICIENCY-BASED):\n"
                     "- For BEGINNERS (A1-A2 proficiency): ALL questions and instructions MUST be in ENGLISH.\n"
                     "  This is essential because beginners would find questions in the target language intimidating.\n"
@@ -1215,7 +1431,7 @@ def generate_lesson_plan_from_assessment_responses(
             lesson_plan = _structured_lesson_plan_fallback(assessment_result, language)
         else:
             cards = []
-            for i, card_data in enumerate(card_data_list[:10], 1):
+            for i, card_data in enumerate(card_data_list[:12], 1):
                 cards.append(_json_to_lesson_card(card_data))
             logger.debug(f"Processed {len(cards)} lesson cards")
             
@@ -1272,14 +1488,15 @@ def generate_structured_lesson_plan(
                     '      "feedback": "...",\n'
                     '      "vocabulary_expansion": [...]\n'
                     "    },\n"
-                    "    ... (10 cards total)\n"
+                    "    ... (12 cards total)\n"
                     "  ]\n"
                     "}\n\n"
                     "Requirements:\n"
-                    "- Create exactly 10 diverse lesson cards\n"
-                    "- Use a mix of card types: multiple_choice, fill_in_blank, image_question, vocabulary, audio_transcription, audio_comprehension\n"
-                    "- Include image_prompts for visual cards (at least 5 out of 10)\n"
+                    "- Create exactly 12 diverse lesson cards\n"
+                    "- Use a mix of card types: multiple_choice, fill_in_blank, image_question, vocabulary, audio_transcription, audio_comprehension, speaking\n"
+                    "- Include image_prompts for visual cards (at least 5 out of 12)\n"
                     "- IMPORTANT: Include 2-3 AUDIO cards (audio_transcription or audio_comprehension) to develop listening skills\n"
+                    "- IMPORTANT: Include 1-2 SPEAKING cards where the user speaks a phrase and it's transcribed\n"
                     "- Target the learner's proficiency level\n"
                     "- Each card should have feedback and vocabulary_expansion\n"
                     "- Vary difficulty slightly but keep it appropriate for the level\n\n"
@@ -1295,6 +1512,15 @@ def generate_structured_lesson_plan(
                     "- For beginners (A1-A2): Use simple sentences, common vocabulary\n"
                     "- For intermediate (B1-B2): Use more complex sentences, varied vocabulary\n"
                     "- For advanced (C1-C2): Use native-speed pacing, idioms, complex structures\n\n"
+                    "SPEAKING CARD REQUIREMENTS:\n"
+                    "- speaking: User records themselves saying a phrase, which is transcribed and compared\n"
+                    f"  - speaking_prompt: The phrase the user should say in {language}\n"
+                    "  - correct_answer: Same as speaking_prompt\n"
+                    "  - instruction: 'Say the following phrase out loud:' (in English)\n"
+                    "  - alternatives: Acceptable variations of the phrase\n"
+                    "- For beginners (A1-A2): Simple greetings, numbers, basic vocabulary (1 sentence)\n"
+                    "- For intermediate (B1-B2): Common phrases, short sentences (1-2 sentences)\n"
+                    "- For advanced (C1-C2): Complex sentences, idioms (2-3 sentences)\n\n"
                     "CRITICAL LANGUAGE RULES:\n"
                     + (
                         # For B1+ learners, questions should be in target language
@@ -1362,7 +1588,7 @@ def generate_structured_lesson_plan(
         
         # Convert JSON to LessonCard objects
         cards = []
-        for card_data in card_data_list[:10]:
+        for card_data in card_data_list[:12]:
             cards.append(_json_to_lesson_card(card_data))
         
         logger.success(f"Generated {len(cards)} lesson cards")
@@ -1411,6 +1637,17 @@ def _structured_lesson_plan_fallback(
     
     audio_data = audio_examples.get(language, audio_examples["Spanish"])
     
+    # Language-specific speaking examples
+    speaking_examples = {
+        "Spanish": "Buenos días, me llamo María.",
+        "French": "Bonjour, je m'appelle Marie.",
+        "German": "Guten Tag, ich heiße Maria.",
+        "Japanese": "おはようございます。私はマリアです。",
+        "Chinese": "早上好，我叫玛丽亚。",
+        "Arabic": "صباح الخير، اسمي ماريا.",
+    }
+    speaking_prompt = speaking_examples.get(language, speaking_examples["Spanish"])
+    
     cards = [
         LessonCard(
             type="image_question",
@@ -1448,8 +1685,17 @@ def _structured_lesson_plan_fallback(
             feedback="Good comprehension!",
             vocabulary_expansion=["market", "Saturday", "fresh"],
         ),
+        # Speaking card
+        LessonCard(
+            type="speaking",
+            instruction="Say the following phrase out loud:",
+            speaking_prompt=speaking_prompt,
+            correct_answer=speaking_prompt,
+            feedback="Good speaking practice!",
+            vocabulary_expansion=["greeting", "introduction", "name"],
+        ),
     ]
-    # Fill to 10 cards with simple variations using safe prompts
+    # Fill to 12 cards with simple variations using safe prompts
     safe_prompts = [
         "a friendly cat sitting on a windowsill, simple illustration",
         "a sunny park with green grass and trees, educational style",
@@ -1457,11 +1703,12 @@ def _structured_lesson_plan_fallback(
         "a blue bicycle leaning against a wall, clear educational image",
         "a beautiful flower garden with colorful flowers, simple style",
         "a cheerful dog playing with a ball, friendly illustration",
+        "a stack of colorful books on a desk, educational style",
     ]
     card_idx = 0
     prompt_idx = 0
-    while len(cards) < 10:
-        # Create variation with different safe image prompts (skip audio cards for variations)
+    while len(cards) < 12:
+        # Create variation with different safe image prompts (skip audio/speaking cards for variations)
         base_card = cards[card_idx % 2]  # Only use first two visual cards as templates
         new_card = LessonCard(
             type=base_card.type,
@@ -1475,7 +1722,7 @@ def _structured_lesson_plan_fallback(
         card_idx += 1
         prompt_idx += 1
     
-    return LessonPlan(cards=cards[:10], proficiency_target=assessment_result.proficiency)
+    return LessonPlan(cards=cards[:12], proficiency_target=assessment_result.proficiency)
 
 
 def evaluate_card_response(
@@ -1531,6 +1778,11 @@ def evaluate_card_response(
     if card.type == "audio_comprehension" and user_response:
         logger.debug(f"Audio comprehension evaluation, response length: {len(user_response)}")
         return _evaluate_text_response_with_api(card, user_response, language)
+    
+    # Speaking: compare user's speech transcription to expected phrase
+    if card.type == "speaking" and user_response:
+        logger.debug(f"Speaking evaluation, transcription length: {len(user_response)}")
+        return evaluate_speaking_response(card, user_response, language)
     
     # Fallback for other types
     logger.debug("Using fallback evaluation (no response or unknown type)")

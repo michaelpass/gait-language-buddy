@@ -37,7 +37,8 @@ class LessonCard:
     """Represents a single structured lesson card."""
     type: Literal[
         "text_question", "multiple_choice", "image_question", 
-        "fill_in_blank", "vocabulary", "audio_transcription", "audio_comprehension"
+        "fill_in_blank", "vocabulary", "audio_transcription", "audio_comprehension",
+        "speaking"
     ]
     question: Optional[str] = None          # Question text (for question types)
     instruction: Optional[str] = None       # Optional instruction in English
@@ -62,6 +63,11 @@ class LessonCard:
     audio_text: Optional[str] = None        # Text to be converted to speech (in target language)
     audio_path: Optional[str] = None        # Path to generated audio file (filled by client)
     comprehension_questions: List[Dict[str, Any]] = field(default_factory=list)  # For audio_comprehension
+    
+    # For speaking exercises
+    speaking_prompt: Optional[str] = None   # What the user should say (in target language)
+    user_recording_path: Optional[str] = None  # Path to user's recorded audio
+    user_transcription: Optional[str] = None   # STT result of user's speech
     
     # Feedback and vocabulary expansion
     feedback: Optional[str] = None          # Feedback shown after submission

@@ -40,6 +40,17 @@ except ImportError:
     print("Note: pygame not installed. Audio playback will be disabled.")
     print("Install with: pip install pygame")
 
+# Audio recording support for speaking exercises
+try:
+    import sounddevice as sd
+    import soundfile as sf
+    import tempfile
+    RECORDING_AVAILABLE = True
+except ImportError:
+    RECORDING_AVAILABLE = False
+    print("Note: sounddevice/soundfile not installed. Recording will be disabled.")
+    print("Install with: pip install sounddevice soundfile")
+
 from core.logger import logger
 from core.api import (
     SUPPORTED_LANGUAGES,
@@ -53,6 +64,7 @@ from core.api import (
     generate_image_async,
     generate_images_parallel,  # Parallel image generation
     generate_speech_async,  # TTS generation
+    transcribe_audio_async,  # STT transcription
 )
 from core.models import (
     AssessmentCard, AssessmentResult, LessonPlan, LessonCard
@@ -634,6 +646,189 @@ class AudioPlayer(ttk.Frame):
                     pygame.mixer.music.unload()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Speech Recorder Widget
+# ---------------------------------------------------------------------------
+
+class SpeechRecorder(ttk.Frame):
+    """
+    A widget for recording user speech for speaking exercises.
+    Records audio and provides callback with the recorded file path.
+    """
+    
+    SAMPLE_RATE = 16000  # Whisper prefers 16kHz
+    CHANNELS = 1  # Mono
+    
+    def __init__(self, parent, on_recording_complete: Optional[Callable[[str], None]] = None, **kwargs) -> None:
+        super().__init__(parent, **kwargs)
+        
+        self._is_recording: bool = False
+        self._recording_data: List = []
+        self._recording_path: Optional[str] = None
+        self._on_complete = on_recording_complete
+        
+        # Prompt label (what to say)
+        self.prompt_label = ttk.Label(
+            self,
+            text="",
+            font=("Helvetica", 16, "bold"),
+            foreground="#ffffff",
+            wraplength=500,
+            justify="center",
+            anchor="center",
+        )
+        self.prompt_label.pack(pady=(10, 15))
+        
+        # Record button
+        self.record_button = ttk.Button(
+            self,
+            text="🎤 Hold to Record",
+            width=20,
+        )
+        self.record_button.pack(pady=10)
+        
+        # Bind press and release for hold-to-record
+        self.record_button.bind("<ButtonPress-1>", self._start_recording)
+        self.record_button.bind("<ButtonRelease-1>", self._stop_recording)
+        
+        # Status label
+        self.status_label = ttk.Label(
+            self,
+            text="Press and hold the button to record",
+            font=("Helvetica", 11),
+            foreground="#7bb3ff",
+            anchor="center",
+        )
+        self.status_label.pack(pady=(5, 10))
+        
+        # Transcription result (shown after recording)
+        self.transcription_label = ttk.Label(
+            self,
+            text="",
+            font=("Helvetica", 13),
+            foreground="#9bc6ff",
+            wraplength=500,
+            justify="center",
+            anchor="center",
+        )
+        self.transcription_label.pack(pady=(5, 0))
+        self.transcription_label.pack_forget()
+        
+        # Check if recording is available
+        if not RECORDING_AVAILABLE:
+            self.record_button.configure(state="disabled")
+            self.status_label.configure(
+                text="Recording not available. Install: pip install sounddevice soundfile",
+                foreground="#ff6b6b"
+            )
+    
+    def set_prompt(self, prompt_text: str) -> None:
+        """Set the phrase the user should say."""
+        self.prompt_label.configure(text=f'"{prompt_text}"')
+        self.transcription_label.pack_forget()
+        self.status_label.configure(text="Press and hold the button to record")
+    
+    def _start_recording(self, event=None) -> None:
+        """Start recording audio."""
+        if not RECORDING_AVAILABLE or self._is_recording:
+            return
+        
+        self._is_recording = True
+        self._recording_data = []
+        self.record_button.configure(text="🔴 Recording...")
+        self.status_label.configure(text="Recording... Release to stop", foreground="#ff6b6b")
+        
+        # Start recording in a thread
+        def record_audio():
+            try:
+                # Record until stopped
+                with sd.InputStream(samplerate=self.SAMPLE_RATE, channels=self.CHANNELS, 
+                                   callback=self._audio_callback):
+                    while self._is_recording:
+                        sd.sleep(100)
+            except Exception as e:
+                logger.error(f"Recording error: {e}")
+                self.after(0, lambda: self.status_label.configure(
+                    text=f"Recording error: {e}", foreground="#ff6b6b"
+                ))
+        
+        self._record_thread = threading.Thread(target=record_audio, daemon=True)
+        self._record_thread.start()
+    
+    def _audio_callback(self, indata, frames, time, status):
+        """Callback for audio input stream."""
+        if status:
+            logger.warning(f"Audio status: {status}")
+        self._recording_data.append(indata.copy())
+    
+    def _stop_recording(self, event=None) -> None:
+        """Stop recording and save the audio."""
+        if not self._is_recording:
+            return
+        
+        self._is_recording = False
+        self.record_button.configure(text="🎤 Hold to Record")
+        self.status_label.configure(text="Processing...", foreground="#7bb3ff")
+        
+        # Save recording in a thread
+        def save_and_callback():
+            try:
+                if not self._recording_data:
+                    self.after(0, lambda: self.status_label.configure(
+                        text="No audio recorded. Try again.", foreground="#ff6b6b"
+                    ))
+                    return
+                
+                import numpy as np
+                # Concatenate all recorded chunks
+                audio_data = np.concatenate(self._recording_data, axis=0)
+                
+                # Save to temp file
+                fd, path = tempfile.mkstemp(suffix=".wav", prefix="gait_recording_")
+                os.close(fd)
+                sf.write(path, audio_data, self.SAMPLE_RATE)
+                
+                self._recording_path = path
+                logger.ui(f"Recording saved: {path}")
+                
+                self.after(0, lambda: self.status_label.configure(
+                    text="Recording complete! Transcribing...", foreground="#7bb3ff"
+                ))
+                
+                # Call the completion callback
+                if self._on_complete:
+                    self._on_complete(path)
+                    
+            except Exception as e:
+                logger.error(f"Save recording error: {e}")
+                self.after(0, lambda: self.status_label.configure(
+                    text=f"Error saving: {e}", foreground="#ff6b6b"
+                ))
+        
+        threading.Thread(target=save_and_callback, daemon=True).start()
+    
+    def show_transcription(self, text: str) -> None:
+        """Show the transcription result."""
+        self.transcription_label.configure(text=f'You said: "{text}"')
+        self.transcription_label.pack(pady=(5, 0))
+        self.status_label.configure(text="Transcription complete", foreground="#7bb3ff")
+    
+    def show_error(self, message: str) -> None:
+        """Show an error message."""
+        self.status_label.configure(text=message, foreground="#ff6b6b")
+    
+    def get_recording_path(self) -> Optional[str]:
+        """Get the path to the recorded audio file."""
+        return self._recording_path
+    
+    def reset(self) -> None:
+        """Reset the recorder for a new recording."""
+        self._recording_data = []
+        self._recording_path = None
+        self.transcription_label.pack_forget()
+        self.status_label.configure(text="Press and hold the button to record", foreground="#7bb3ff")
 
 
 # ---------------------------------------------------------------------------
@@ -1640,6 +1835,10 @@ class LessonCardView(ttk.Frame):
         # Audio player (for audio questions)
         self.audio_player: Optional[AudioPlayer] = None
         self.current_audio_path: Optional[str] = None
+        
+        # Speech recorder (for speaking exercises)
+        self.speech_recorder: Optional[SpeechRecorder] = None
+        self.current_transcription: Optional[str] = None
 
         self.next_button = ttk.Button(
             self.content, text="Submit Answer", command=self._on_next_clicked
@@ -1804,6 +2003,8 @@ class LessonCardView(ttk.Frame):
             self._render_vocabulary(card)
         elif card.type in ("audio_transcription", "audio_comprehension"):
             self._render_audio_card(card)
+        elif card.type == "speaking":
+            self._render_speaking_card(card)
         else:
             self._render_text_input(card)
     
@@ -1925,6 +2126,59 @@ class LessonCardView(ttk.Frame):
         
         self.answer_frame.grid()
     
+    def _render_speaking_card(self, card: LessonCard) -> None:
+        """Render speaking exercise card with recording interface."""
+        # Clear multiple choice buttons if they exist
+        if hasattr(self, 'mc_buttons'):
+            for btn in self.mc_buttons:
+                btn.destroy()
+            self.mc_buttons = []
+        
+        # Hide image and audio areas
+        self.responsive_image.grid_remove()
+        if self.audio_player:
+            self.audio_player.grid_remove()
+        
+        # Reset transcription
+        self.current_transcription = None
+        
+        # Create speech recorder if needed
+        if not self.speech_recorder:
+            self.speech_recorder = SpeechRecorder(
+                self.content,
+                on_recording_complete=self._on_recording_complete
+            )
+        
+        # Set the prompt and show the recorder
+        speaking_prompt = card.speaking_prompt or card.correct_answer or ""
+        self.speech_recorder.set_prompt(speaking_prompt)
+        self.speech_recorder.grid(row=3, column=0, pady=(10, 10))
+        
+        # Hide the answer frame for speaking cards (recorder handles input)
+        self.answer_frame.grid_remove()
+    
+    def _on_recording_complete(self, audio_path: str) -> None:
+        """Handle completed recording - transcribe the audio."""
+        language = self.controller.selected_language or "Spanish"
+        
+        def on_transcription_complete(transcription: Optional[str]) -> None:
+            """Callback when transcription is complete."""
+            def update_ui():
+                if transcription:
+                    self.current_transcription = transcription
+                    if self.speech_recorder:
+                        self.speech_recorder.show_transcription(transcription)
+                    logger.ui(f"Transcription: {transcription}")
+                else:
+                    if self.speech_recorder:
+                        self.speech_recorder.show_error("Could not transcribe audio. Try again.")
+                    logger.error("Transcription failed")
+            
+            self.after(0, update_ui)
+        
+        # Transcribe in background
+        transcribe_audio_async(audio_path, language, on_transcription_complete)
+    
     def _generate_audio_for_card(self, card: LessonCard) -> None:
         """Generate TTS audio for a card asynchronously."""
         if not card.audio_text:
@@ -2004,6 +2258,12 @@ class LessonCardView(ttk.Frame):
         if self.audio_player:
             self.audio_player.stop()
             self.audio_player.grid_remove()
+        
+        # Clean up speech recorder
+        if self.speech_recorder:
+            self.speech_recorder.reset()
+            self.speech_recorder.grid_remove()
+        self.current_transcription = None
     
     def _on_mc_selected(self, index: int) -> None:
         """Handle multiple choice selection - buttons stay depressed (radio button style)."""
@@ -2113,6 +2373,12 @@ class LessonCardView(ttk.Frame):
             # Vocabulary cards don't need submission, just continue
             self.controller.next_lesson_card()
             return
+        elif card.type == "speaking":
+            # Speaking cards use the transcription
+            if not self.current_transcription:
+                messagebox.showinfo("Record your speech", "Please record yourself saying the phrase first.")
+                return
+            response = self.current_transcription
         else:
             if not hasattr(self, 'text_widget') or not self.text_widget:
                 messagebox.showinfo("Enter an answer", "Please enter your answer.")
