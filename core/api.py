@@ -1724,7 +1724,7 @@ def generate_structured_lesson_plan(
     teaching_plan: Optional[TeachingPlan] = None
 ) -> LessonPlan:
     """
-    Generate a 12-card quiz based on assessment results and teaching content.
+    Generate a 20-card quiz based on assessment results and teaching content.
     
     Uses structured JSON format to create varied lesson cards including
     multiple choice, fill-in-blank, image questions, etc.
@@ -1877,24 +1877,23 @@ Review words: {teaching_plan.review_words_count}
                     '      "feedback": "Correct! bin is the first person form of sein.",\n'
                     '      "vocabulary_expansion": ["sein", "müde"]\n'
                     "    },\n"
-                    "    ... (12 cards total)\n"
+                    "    ...\n"
                     "  ]\n"
                     "}\n\n"
                     "Requirements:\n"
-                    "- Create exactly 12 quiz cards\n"
-                    "- **CRITICAL**: At least 8-10 cards should test vocabulary/grammar from the TEACHING CONTENT below\n"
-                    "- The remaining 2-4 cards can test general knowledge at the learner's level\n"
-                    "- Use a mix of card types - REQUIRED DISTRIBUTION:\n"
-                    "  • 2-3 multiple_choice - vocabulary/translation questions\n"
-                    "  • 2-3 fill_in_blank - grammar/conjugation practice\n"
-                    "  • 2-3 image_question - visual vocabulary (MUST have image_prompt)\n"
-                    "  • 1-2 audio_transcription - listen and write (TTS cards)\n"
-                    "  • 1 audio_comprehension - listen to passage and answer\n"
-                    "  • 1-2 speaking - say phrase out loud (STT cards)\n"
-                    "  • 1 word_order - arrange scrambled words to form sentence\n"
-                    "  • 0-1 reading_comprehension - read passage, answer questions\n"
-                    "  • 0-1 writing_practice - free writing with feedback\n"
-                    "- TOTAL: Exactly 12 cards\n\n"
+                    "- Generate the exact number of cards requested in each batch\n"
+                    "- **CRITICAL**: Quiz cards should test vocabulary/grammar from the TEACHING CONTENT below\n"
+                    "- Use the card types specified in the batch request\n"
+                    "- Card type guidelines:\n"
+                    "  • multiple_choice - vocabulary/translation questions\n"
+                    "  • fill_in_blank - grammar/conjugation practice\n"
+                    "  • image_question - visual vocabulary (MUST have image_prompt)\n"
+                    "  • audio_transcription - listen and write (TTS cards)\n"
+                    "  • audio_comprehension - listen to passage and answer\n"
+                    "  • speaking - say phrase out loud (STT cards)\n"
+                    "  • word_order - arrange scrambled words to form sentence\n"
+                    "  • reading_comprehension - read passage, answer questions\n"
+                    "  • writing_practice - free writing with feedback\n\n"
                     "MULTIMEDIA REQUIREMENTS:\n"
                     "- Include image_prompts for at least 5 cards (image_question, multiple_choice, etc.)\n"
                     "- Audio cards (audio_transcription, audio_comprehension) need audio_text field\n"
@@ -2060,36 +2059,169 @@ Review words: {teaching_plan.review_words_count}
                         # Explicitly pass words to test from teaching phase
                         "words_to_test": all_words[:15] if all_words else [],
                         "verbs_to_test": all_verbs[:10] if all_verbs else [],
-                        "instruction": "Generate 12 quiz cards. PRIORITIZE testing the words and verbs listed above - they were JUST taught in this session's lesson!",
+                        "instruction": "PRIORITIZE testing the words and verbs listed above - they were JUST taught in this session's lesson!",
                     },
                     ensure_ascii=False,
                 ),
             },
         ]
         
-        logger.api_call("chat.completions.create (structured_lesson)", model=DEFAULT_CHAT_MODEL)
-        with Timer() as timer:
-            completion = client.chat.completions.create(
-                model=DEFAULT_CHAT_MODEL,
-                response_format={"type": "json_object"},
-                messages=messages,
-                temperature=0.7,  # Lower temp for faster, more consistent responses
-                max_tokens=4000,  # Limit tokens for faster response
-            )
-        logger.api_response("chat.completions.create", duration_ms=timer.duration_ms)
+        # BATCHED QUIZ GENERATION: Sequential batches with context passing to avoid duplicates
+        # Batch 1: Core quiz types (multiple_choice, fill_in_blank, image_question, text_question) - 10 cards
+        # Batch 2: Audio/Speaking types (audio_transcription, speaking, audio_comprehension) - 6 cards
+        # Batch 3: Extended types (word_order, reading_comprehension, writing_practice) - 4 cards
         
-        raw = completion.choices[0].message.content
-        data = json.loads(raw)
-        card_data_list = data.get("lesson_cards", []) or []
+        quiz_batches = [
+            {
+                "name": "core",
+                "count": 10,
+                "types": ["multiple_choice", "fill_in_blank", "image_question", "text_question"],
+                "instruction": "Generate 10 cards: 3 multiple_choice, 3 fill_in_blank, 2 image_question, 2 text_question (translation questions)"
+            },
+            {
+                "name": "audio_speaking",
+                "count": 6,
+                "types": ["audio_transcription", "speaking", "audio_comprehension"],
+                "instruction": "Generate 6 cards: 2 audio_transcription, 3 speaking, 1 audio_comprehension"
+            },
+            {
+                "name": "extended",
+                "count": 4,
+                "types": ["word_order", "reading_comprehension", "writing_practice"],
+                "instruction": "Generate 4 cards: 2 word_order, 1 reading_comprehension, 1 writing_practice"
+            },
+        ]
         
-        if not card_data_list:
-            logger.warning("No lesson cards in response, using fallback")
-            return _structured_lesson_plan_fallback(assessment_result, language)
+        all_cards = []
+        all_card_data = []  # Track raw card data for context passing
+        generated_questions = []  # Track questions/vocabulary already used
+        system_content = messages[0]["content"]
         
-        # Convert JSON to LessonCard objects
-        cards = []
-        for card_data in card_data_list[:12]:
-            cards.append(_json_to_lesson_card(card_data))
+        for batch_num, batch in enumerate(quiz_batches, 1):
+            # Build context of previously generated cards to avoid duplicates
+            previous_context = ""
+            if generated_questions:
+                previous_context = f"""
+🚫🚫🚫 DUPLICATE PREVENTION - CARDS ALREADY GENERATED 🚫🚫🚫
+The following questions/vocabulary have ALREADY been used in previous batches.
+DO NOT create cards that test the same words, phrases, or concepts!
+
+Already tested ({len(generated_questions)} items):
+{chr(10).join(f"- {q}" for q in generated_questions[:30])}
+
+Generate COMPLETELY DIFFERENT questions testing DIFFERENT vocabulary.
+🚫🚫🚫 END DUPLICATE LIST 🚫🚫🚫
+"""
+            
+            batch_prompt = f"""Generate EXACTLY {batch['count']} UNIQUE quiz cards for this batch.
+
+{batch['instruction']}
+
+Card types for this batch: {', '.join(batch['types'])}
+{previous_context}
+
+🎯 VOCABULARY TO TEST (from teaching phase - use different words than already tested):
+Words: {', '.join(all_words[:15]) if all_words else '(general vocabulary)'}
+Verbs: {', '.join(all_verbs[:10]) if all_verbs else '(general verbs)'}
+
+Target proficiency: {assessment_result.proficiency}
+Language: {language}
+
+⚠️ CRITICAL: Each card must test DIFFERENT vocabulary/concepts. No duplicate questions!
+
+Return ONLY JSON: {{"lesson_cards": [...]}}"""
+            
+            logger.api_call(f"chat.completions.create (quiz_batch_{batch['name']})", model=DEFAULT_CHAT_MODEL)
+            with Timer() as timer:
+                completion = client.chat.completions.create(
+                    model=DEFAULT_CHAT_MODEL,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": batch_prompt},
+                    ],
+                    temperature=0.7,
+                    max_tokens=3000,
+                )
+            logger.api_response(f"quiz_batch_{batch['name']}", duration_ms=timer.duration_ms)
+            
+            raw = completion.choices[0].message.content
+            data = json.loads(raw)
+            card_data_list = data.get("lesson_cards", []) or []
+            
+            batch_cards = []
+            for card_data in card_data_list[:batch['count']]:
+                card = _json_to_lesson_card(card_data)
+                batch_cards.append(card)
+                all_card_data.append(card_data)
+                
+                # Track what vocabulary/questions have been generated to prevent duplicates
+                if card.question:
+                    generated_questions.append(card.question[:80])
+                if card.correct_answer:
+                    generated_questions.append(f"Answer: {card.correct_answer}")
+                if card.speaking_prompt:
+                    generated_questions.append(f"Speaking: {card.speaking_prompt}")
+                if card.audio_text:
+                    generated_questions.append(f"Audio: {card.audio_text[:50]}")
+            
+            logger.debug(f"Quiz batch {batch_num} ({batch['name']}): Generated {len(batch_cards)}/{batch['count']} cards, tracking {len(generated_questions)} items")
+            all_cards.extend(batch_cards)
+        
+        cards = all_cards
+        target_count = 20
+        
+        # BACKFILL: If we still have fewer than 20 cards, request more
+        if len(cards) < target_count:
+            needed = target_count - len(cards)
+            logger.warning(f"Quiz backfill needed: {needed} more cards (got {len(cards)}/20)")
+            
+            # Determine which card types are missing
+            type_counts = {}
+            for card in cards:
+                type_counts[card.type] = type_counts.get(card.type, 0) + 1
+            
+            backfill_prompt = f"""Generate EXACTLY {needed} MORE UNIQUE quiz cards.
+
+Current types: {type_counts}
+Need more variety - generate any mix of: multiple_choice, fill_in_blank, image_question, text_question, speaking, word_order
+
+🚫 ALREADY GENERATED - DO NOT DUPLICATE:
+{chr(10).join(f"- {q}" for q in generated_questions[:40])}
+
+Target proficiency: {assessment_result.proficiency}
+Language: {language}
+
+⚠️ Generate DIFFERENT questions testing DIFFERENT vocabulary than listed above!
+
+Return ONLY JSON: {{"lesson_cards": [...]}}"""
+            
+            try:
+                backfill_completion = client.chat.completions.create(
+                    model=DEFAULT_CHAT_MODEL,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": backfill_prompt},
+                    ],
+                    temperature=0.8,
+                    max_tokens=2500,
+                )
+                backfill_raw = backfill_completion.choices[0].message.content
+                backfill_data = json.loads(backfill_raw)
+                backfill_cards = backfill_data.get("lesson_cards", [])
+                
+                for card_data in backfill_cards:
+                    if len(cards) >= target_count:
+                        break
+                    cards.append(_json_to_lesson_card(card_data))
+                    logger.debug(f"Backfill: Added {card_data.get('type', 'unknown')} card")
+                    
+            except Exception as backfill_error:
+                logger.warning(f"Quiz backfill API call failed: {backfill_error}")
+        
+        if len(cards) < target_count:
+            logger.warning(f"Could only generate {len(cards)}/{target_count} quiz cards after batched generation")
         
         logger.success(f"Generated {len(cards)} lesson cards")
         return LessonPlan(
@@ -2195,7 +2327,7 @@ def _structured_lesson_plan_fallback(
             vocabulary_expansion=["greeting", "introduction", "name"],
         ),
     ]
-    # Fill to 12 cards with simple variations using safe prompts
+    # Fill to 20 cards with simple variations using safe prompts
     safe_prompts = [
         "a friendly cat sitting on a windowsill, simple illustration",
         "a sunny park with green grass and trees, educational style",
@@ -2207,7 +2339,7 @@ def _structured_lesson_plan_fallback(
     ]
     card_idx = 0
     prompt_idx = 0
-    while len(cards) < 12:
+    while len(cards) < 20:
         # Create variation with different safe image prompts (skip audio/speaking cards for variations)
         base_card = cards[card_idx % 2]  # Only use first two visual cards as templates
         new_card = LessonCard(
@@ -2222,7 +2354,7 @@ def _structured_lesson_plan_fallback(
         card_idx += 1
         prompt_idx += 1
     
-    return LessonPlan(cards=cards[:12], proficiency_target=assessment_result.proficiency)
+    return LessonPlan(cards=cards[:20], proficiency_target=assessment_result.proficiency)
 
 
 # ---------------------------------------------------------------------------
@@ -2487,18 +2619,19 @@ EVERY verb in review MUST have a conjugation_table immediately following it.""",
         avoid_words = ""
         if existing_words:
             # Show all existing words to avoid duplicates across batches AND previous sessions
-            # Limit display to avoid overwhelming the context (but we still filter post-generation)
-            display_words = existing_words[:100]  # Show first 100 for context
+            display_words = existing_words[:150]  # Show more words for better context
             avoid_words = f"""
 
-🚫🚫🚫 ABSOLUTELY FORBIDDEN - DUPLICATE PREVENTION 🚫🚫🚫
-The following {len(existing_words)} words are BANNED. Do NOT use ANY of them:
-{', '.join(display_words)}{'...' if len(existing_words) > 100 else ''}
+🚫🚫🚫 CRITICAL: DUPLICATE PREVENTION 🚫🚫🚫
+You MUST NOT generate any of these {len(existing_words)} words that have already been used:
 
-⚠️ STRICT RULE: If you generate ANY word from this list, it will be REJECTED.
-⚠️ Generate COMPLETELY DIFFERENT vocabulary.
-⚠️ If you're struggling, try different categories: colors, weather, body parts, emotions, food, animals, etc.
-🚫🚫🚫 END FORBIDDEN LIST 🚫🚫🚫"""
+BANNED WORDS (generate COMPLETELY DIFFERENT vocabulary):
+{', '.join(display_words)}{'...' if len(existing_words) > 150 else ''}
+
+⚠️ ANY duplicate will cause the card to be REJECTED and require regeneration.
+⚠️ Use DIFFERENT word categories if needed: colors, weather, body parts, emotions, food, animals, furniture, clothing, sports, occupations, nature, time expressions, etc.
+⚠️ Check EVERY word you generate against this list before including it.
+🚫🚫🚫 END BANNED LIST 🚫🚫🚫"""
         
         conjugation_schema = """
 For VERB cards (part_of_speech: "verb"), ALWAYS follow with a conjugation_table card:
@@ -2580,6 +2713,7 @@ For conjugation_table cards: infinitive, translation, tense, verb_type, conjugat
         
         cards = []
         seen_in_batch = set()  # Track words seen in THIS batch too
+        duplicates_filtered = 0
         
         for card_data in cards_data:
             card = _json_to_teaching_card(card_data)
@@ -2590,10 +2724,12 @@ For conjugation_table cards: infinitive, translation, tense, verb_type, conjugat
             
             if normalized_word and normalized_word in normalized_existing:
                 logger.warning(f"Filtering duplicate word from batch: '{word_to_check}' (normalized: '{normalized_word}')")
+                duplicates_filtered += 1
                 continue  # Skip this duplicate card
             
             if normalized_word and normalized_word in seen_in_batch:
                 logger.warning(f"Filtering duplicate within batch: '{word_to_check}'")
+                duplicates_filtered += 1
                 continue  # Skip duplicate within same batch
             
             # Track this word
@@ -2608,6 +2744,80 @@ For conjugation_table cards: infinitive, translation, tense, verb_type, conjugat
                 card.is_new = False
                 card.is_review = True
             cards.append(card)
+        
+        # BACKFILL: If duplicates were filtered, request replacement cards
+        backfill_attempts = 0
+        max_backfill_attempts = 2
+        while len(cards) < num_cards and duplicates_filtered > 0 and backfill_attempts < max_backfill_attempts:
+            backfill_attempts += 1
+            needed = num_cards - len(cards)
+            logger.warning(f"Backfill attempt {backfill_attempts}: Need {needed} more cards (filtered {duplicates_filtered} duplicates)")
+            
+            # Update the forbidden words list with what we've already generated
+            all_forbidden = list(existing_words or [])
+            for word in seen_in_batch:
+                if word not in all_forbidden:
+                    all_forbidden.append(word)
+            
+            # Make another API call for replacement cards
+            backfill_prompt = f"""Generate EXACTLY {needed} NEW {batch_type} cards for {proficiency} level {language}.
+
+🚫🚫🚫 CRITICAL - THESE WORDS ARE BANNED (already used) 🚫🚫🚫
+{', '.join(all_forbidden[:150])}
+
+You MUST generate {needed} COMPLETELY DIFFERENT words not in the banned list above.
+Try different categories: colors, weather, body parts, emotions, food, animals, family, clothing, furniture, sports, etc.
+
+Return ONLY JSON: {{"cards": [...]}}
+{f'Theme: {theme}' if theme else ''}"""
+            
+            try:
+                backfill_completion = client.chat.completions.create(
+                    model=DEFAULT_CHAT_MODEL,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": backfill_prompt},
+                    ],
+                    temperature=0.9,  # Higher temp for more variety
+                    max_tokens=1500,
+                )
+                backfill_raw = backfill_completion.choices[0].message.content
+                backfill_data = json.loads(backfill_raw)
+                backfill_cards_data = backfill_data.get("cards", backfill_data.get("teaching_cards", []))
+                
+                duplicates_filtered = 0  # Reset counter for this backfill batch
+                for card_data in backfill_cards_data:
+                    if len(cards) >= num_cards:
+                        break
+                    card = _json_to_teaching_card(card_data)
+                    word_to_check = card.word or card.infinitive or ""
+                    normalized_word = _normalize_word(word_to_check, language)
+                    
+                    # Check against all existing + seen words
+                    if normalized_word and (normalized_word in normalized_existing or normalized_word in seen_in_batch):
+                        logger.warning(f"Backfill: Filtering duplicate '{word_to_check}'")
+                        duplicates_filtered += 1
+                        continue
+                    
+                    if normalized_word:
+                        seen_in_batch.add(normalized_word)
+                    
+                    if batch_type == "vocabulary":
+                        card.is_new = True
+                        card.is_review = False
+                    elif batch_type == "review":
+                        card.is_new = False
+                        card.is_review = True
+                    cards.append(card)
+                    logger.debug(f"Backfill: Added '{word_to_check}'")
+                    
+            except Exception as backfill_error:
+                logger.warning(f"Backfill API call failed: {backfill_error}")
+                break
+        
+        if len(cards) < num_cards:
+            logger.warning(f"Could only generate {len(cards)}/{num_cards} unique cards after backfill attempts")
         
         # POST-PROCESSING: Ensure verbs have conjugation tables
         final_cards = []
@@ -3560,59 +3770,66 @@ def _evaluate_writing_practice(
                 "role": "system",
                 "content": f"""You are an expert {language} language tutor providing detailed writing feedback.
 
-LEARNER LEVEL: {proficiency}
 WRITING PROMPT: {writing_prompt}
 TARGET LENGTH: {min_words}-{max_words} words
 ACTUAL LENGTH: {word_count} words
+LEARNER'S CURRENT LEVEL: {proficiency} (but they may be more advanced!)
 
-LEVEL-APPROPRIATE EXPECTATIONS for {proficiency}:
-- A1: Simple sentences, basic vocabulary, spelling attempts acceptable
-- A2: Short paragraphs, common words, minor grammar errors OK
-- B1: Connected text, varied vocabulary, some complex sentences
-- B2: Clear arguments, good range, mostly correct grammar
-- C1: Sophisticated expression, precise vocabulary, complex structures
-- C2: Near-native quality, subtle nuances, rare errors
+🚨 CRITICAL EVALUATION RULES 🚨
 
-Analyze the student's writing comprehensively (calibrated for {proficiency}):
+1. CORRECTNESS = Is the German grammatically correct and does it address the prompt?
+   - If YES → is_correct = true (regardless of complexity level)
+   - If the writing has significant grammar errors → is_correct = false
+   - Using complex language is GOOD, not a penalty!
+
+2. SCORING RULES:
+   - Base score on ACCURACY of grammar and vocabulary (not simplicity)
+   - REWARD complexity and advanced vocabulary usage
+   - Score 85-100: Grammatically correct with good vocabulary
+   - Score 70-84: Minor errors but communicates well  
+   - Score 50-69: Some errors but understandable
+   - Score below 50: Major errors that impede understanding
+
+3. DEMONSTRATED FLUENCY:
+   - If they write ABOVE {proficiency} level, note this as a STRENGTH
+   - Advanced vocabulary and complex structures should INCREASE the score
+   - This is evidence they may be more fluent than their current level suggests
+
+Analyze comprehensively:
 
 1. GRAMMAR ANALYSIS
-   - Identify specific grammar errors
-   - Note correct grammar usage
-   - Provide corrections with explanations
+   - Identify specific grammar errors (if any)
+   - Note correct grammar usage - especially complex constructions
+   - Provide corrections with explanations for any errors
 
-2. VOCABULARY ASSESSMENT
-   - Evaluate vocabulary range and appropriateness
-   - Suggest more advanced alternatives where applicable
-   - Note any incorrect word usage
+2. VOCABULARY ASSESSMENT  
+   - Evaluate vocabulary range
+   - Note impressive vocabulary choices
+   - Only suggest alternatives if a word is actually wrong
 
-3. STRUCTURE & STYLE
-   - Comment on sentence structure variety
-   - Assess coherence and flow
-   - Note any stylistic improvements
-
-4. ERROR PATTERNS
-   - Identify recurring error types for targeted practice
-   - Categorize errors: gender_agreement, verb_conjugation, word_order, spelling, etc.
+3. DEMONSTRATED LEVEL
+   - Estimate what CEFR level this writing actually demonstrates (A1-C2)
+   - If higher than {proficiency}, explicitly note this
 
 Return ONLY a JSON object:
 {{
-    "is_correct": true if writing demonstrates {proficiency}-level proficiency,
-    "card_score": 0-100 based on quality FOR A {proficiency} LEARNER,
-    "feedback": "Overall assessment and encouragement",
-    "correct_answer": "A corrected version of their writing",
+    "is_correct": true if German is grammatically correct and addresses prompt,
+    "card_score": 0-100 (REWARD accuracy and complexity, not simplicity),
+    "demonstrated_level": "A1|A2|B1|B2|C1|C2 - what level this writing actually shows",
+    "feedback": "Positive assessment - praise complexity if present, note any actual errors",
+    "correct_answer": "Only provide corrections if there were actual errors, otherwise leave empty",
     "alternatives": [],
-    "vocabulary_expansion": ["Advanced vocabulary suggestions"],
+    "vocabulary_expansion": ["Related advanced vocabulary they might also enjoy learning"],
     "writing_feedback": {{
         "grammar_errors": [
             {{"error": "original text", "correction": "corrected text", "explanation": "why", "error_type": "category"}}
         ],
-        "vocabulary_suggestions": [
-            {{"original": "basic word", "advanced": "better alternative", "context": "when to use"}}
-        ],
-        "strengths": ["What they did well"],
-        "areas_to_improve": ["What to focus on"],
+        "vocabulary_suggestions": [],
+        "strengths": ["What they did well - especially note advanced usage"],
+        "areas_to_improve": ["Only actual errors, not 'too complex'"],
         "style_notes": "Comments on writing style",
-        "error_types": ["list of error category strings for tracking"]
+        "demonstrated_proficiency": "Explicit note if writing shows higher level than {proficiency}",
+        "error_types": ["list of error category strings for tracking - empty if no errors"]
     }}
 }}"""
             },
@@ -3637,16 +3854,39 @@ Return ONLY a JSON object:
         data = json.loads(raw)
         
         # Store detailed feedback in the card for UI display
-        card.writing_feedback = data.get("writing_feedback", {})
+        writing_feedback = data.get("writing_feedback", {})
+        card.writing_feedback = writing_feedback
         
         # Extract error types for tracking
-        error_types = data.get("writing_feedback", {}).get("error_types", [])
+        error_types = writing_feedback.get("error_types", [])
         if error_types:
             card.error_types = error_types
         
+        # Log demonstrated level for proficiency tracking
+        demonstrated_level = data.get("demonstrated_level", proficiency)
+        if demonstrated_level != proficiency:
+            logger.info(f"Writing demonstrates {demonstrated_level} level (current: {proficiency})")
+            # Store in writing_feedback for later use in proficiency re-evaluation
+            writing_feedback["demonstrated_level"] = demonstrated_level
+        
+        # If writing shows higher level than expected, boost the score
+        level_order = ["A1", "A2", "B1", "B2", "C1", "C2"]
+        card_score = data.get("card_score", 50)
+        try:
+            current_idx = level_order.index(proficiency) if proficiency in level_order else 0
+            demonstrated_idx = level_order.index(demonstrated_level) if demonstrated_level in level_order else current_idx
+            if demonstrated_idx > current_idx:
+                # Bonus for demonstrating higher proficiency
+                level_diff = demonstrated_idx - current_idx
+                bonus = min(level_diff * 5, 15)  # Up to +15 bonus
+                card_score = min(100, card_score + bonus)
+                logger.debug(f"Writing score boosted by {bonus} for demonstrating {demonstrated_level} (was {proficiency})")
+        except ValueError:
+            pass
+        
         return {
-            "is_correct": data.get("is_correct", False),
-            "card_score": data.get("card_score", 50),
+            "is_correct": data.get("is_correct", True),  # Default to True - don't penalize if LLM fails
+            "card_score": card_score,
             "feedback": data.get("feedback", "Keep practicing!"),
             "correct_answer": data.get("correct_answer", ""),
             "alternatives": data.get("alternatives", []),
@@ -3696,21 +3936,37 @@ def evaluate_quiz_performance(
         # Collect quiz performance data (excluding skipped cards - STT/TTS exercises)
         cards_data = []
         skipped_count = 0
+        demonstrated_levels = []  # Track demonstrated proficiency from writing exercises
+        
         for card in lesson_plan.cards:
             if card.skipped:
                 skipped_count += 1
                 continue  # Don't include skipped cards in evaluation
-            cards_data.append({
+            
+            card_info = {
                 "question": card.question[:100] if card.question else "",
                 "type": card.type,
                 "difficulty": card.difficulty_level,
                 "is_correct": card.is_correct,
                 "score": card.card_score,
                 "user_response": card.user_response[:100] if card.user_response else "",
-            })
+            }
+            
+            # Include demonstrated level from writing exercises
+            if card.type == "writing_practice" and card.writing_feedback:
+                demonstrated_level = card.writing_feedback.get("demonstrated_level")
+                if demonstrated_level:
+                    card_info["demonstrated_level"] = demonstrated_level
+                    demonstrated_levels.append(demonstrated_level)
+                    logger.debug(f"Writing exercise demonstrated {demonstrated_level} proficiency")
+            
+            cards_data.append(card_info)
         
         if skipped_count > 0:
             logger.debug(f"Excluded {skipped_count} skipped cards from evaluation")
+        
+        if demonstrated_levels:
+            logger.info(f"Writing exercises demonstrated levels: {demonstrated_levels}")
         
         # Calculate stats excluding skipped cards
         scored_cards = [c for c in lesson_plan.cards if not c.skipped]
@@ -3718,7 +3974,19 @@ def evaluate_quiz_performance(
         total_count = len(scored_cards)
         quiz_percentage = (correct_count / total_count * 100) if total_count > 0 else 0
         
-        logger.debug(f"Quiz results: {correct_count}/{total_count} correct ({quiz_percentage:.1f}%), {skipped_count} skipped")
+        # Calculate performance by card type for granular analysis
+        type_performance = {}
+        for card in scored_cards:
+            if card.type not in type_performance:
+                type_performance[card.type] = {"correct": 0, "total": 0}
+            type_performance[card.type]["total"] += 1
+            if card.is_correct:
+                type_performance[card.type]["correct"] += 1
+        
+        # Calculate average score
+        avg_score = sum(c.card_score for c in scored_cards) / len(scored_cards) if scored_cards else 0
+        
+        logger.debug(f"Quiz results: {correct_count}/{total_count} correct ({quiz_percentage:.1f}%), avg score: {avg_score:.0f}, skipped: {skipped_count}")
         if learner_context:
             logger.debug(f"Learner context: {len(learner_context)} chars of history data")
         
@@ -3750,45 +4018,58 @@ CURRENT PROFICIENCY:
 TODAY'S QUIZ RESULTS:
 - Questions: {total_count}
 - Correct: {correct_count} ({quiz_percentage:.1f}%)
+- Average Score: {avg_score:.0f}/100
+
+PERFORMANCE BY QUESTION TYPE:
+{chr(10).join(f"- {qtype}: {data['correct']}/{data['total']} correct ({data['correct']/data['total']*100:.0f}%)" for qtype, data in type_performance.items())}
+
+{f"🌟 DEMONSTRATED HIGHER PROFICIENCY IN WRITING: {', '.join(demonstrated_levels)}" if demonstrated_levels else ""}
+{f"If writing exercises show proficiency ABOVE current level ({current_assessment.proficiency}), this is strong evidence for potential level upgrade." if demonstrated_levels else ""}
 {history_section}
 
-HOLISTIC SCORING GUIDELINES:
+🚨 CRITICAL: REALISTIC FLUENCY SCORING 🚨
 
-1. FLUENCY SCORE (0-100) - Based on overall competence:
-   - Consider vocabulary breadth AND retention (mastered vs weak words)
-   - Consider consistency across sessions (not just this quiz)
-   - Consider grammar pattern mastery
-   - Adjust by -15 to +15 based on trajectory:
-     * Consistently improving with good retention: +10 to +15
-     * Good quiz, stable performance: +5 to +10
-     * Average performance: -5 to +5
-     * Declining performance or poor retention: -10 to -5
-     * Significantly struggling: -15 to -10
+Fluency is a LONG-TERM metric that represents overall language competence. It should NOT swing wildly from lesson to lesson.
 
-2. PROFICIENCY LEVEL (A1 → A2 → B1 → B2 → C1 → C2):
-   - Upgrade if: Mastered 80%+ of current level vocabulary, strong grammar, consistent good performance
-   - Downgrade if: Struggling with current level content across multiple sessions, poor retention
-   - Look at the TREND, not just one quiz
-   - A1→A2: Basic survival phrases + simple present tense mastered
-   - A2→B1: Can discuss routine matters, past/future tenses, 1000+ words
-   - B1→B2: Can discuss abstract topics, conditional, 2500+ words
-   - B2→C1: Nuanced expression, complex grammar, 5000+ words
-   - C1→C2: Near-native fluency, idioms, rare vocabulary
+FLUENCY CHANGE GUIDELINES (be CONSERVATIVE):
+- A single lesson should typically change fluency by -3 to +3 points
+- Maximum change in one session: -5 to +5 (requires exceptional performance or major issues)
+- Changes of +10 or more are UNREALISTIC and should NEVER happen from one quiz
 
-3. VOCABULARY vs GRAMMAR assessment:
-   - If vocabulary strong but grammar weak: Higher vocab level, lower grammar level
-   - These should be assessed INDEPENDENTLY based on the evidence
+WHEN TO ADJUST FLUENCY:
++3 to +5: EXCEPTIONAL performance (90%+ correct) AND strong vocabulary retention across sessions
++1 to +2: Good performance (75-89% correct) with stable learning trajectory  
+0: Average performance (60-74%) or mixed results
+-1 to -2: Below average (50-59%) or inconsistent performance
+-3 to -5: Poor performance (below 50%) or significant decline in retention
+
+EVIDENCE REQUIRED FOR ANY CHANGE:
+- For positive change: Point to specific evidence of improvement (mastered words, consistent accuracy)
+- For negative change: Point to specific evidence of struggle (weak words, error patterns)
+- If no clear evidence of change: Keep fluency STABLE (change of 0)
+
+PROFICIENCY LEVEL CHANGES (A1 → A2 → B1 → B2 → C1 → C2):
+Level changes should generally be rare, BUT can happen sooner with strong evidence:
+- Upgrade if: Writing exercises demonstrate higher proficiency (strongest evidence!), OR 80%+ vocab mastered with consistent 85%+ scores
+- Downgrade if: Consistent poor performance (below 50%) over 5+ sessions
+- 🌟 WRITING EVIDENCE: If the learner's free-form writing demonstrates B1 level while they're classified as A1, this is STRONG evidence for an upgrade. Productive writing is the best indicator of true fluency.
+- Consider the "demonstrated_level" field in writing_practice cards - this shows what level their actual language production achieves.
+
+VOCABULARY vs GRAMMAR (assess independently):
+- Strong vocab + weak grammar = Higher vocab level, lower grammar level
+- Use evidence from error patterns and quiz performance
 
 Return ONLY a JSON object:
 {{
     "proficiency": "A1" or "A2" or "B1" or "B2" or "C1" or "C2",
-    "vocabulary_level": "A1" to "C2",
+    "vocabulary_level": "A1" to "C2", 
     "grammar_level": "A1" to "C2",
-    "fluency_score": 0-100 (holistically adjusted),
+    "fluency_score": {current_assessment.fluency_score} +/- small adjustment (typically -3 to +3),
+    "fluency_justification": "Specific evidence from learning history justifying the change (or lack thereof)",
     "strengths": ["Updated strength 1", "Updated strength 2", "Updated strength 3"],
     "weaknesses": ["Updated weakness 1", "Updated weakness 2"],
     "recommendations": ["Specific recommendation 1", "Specific recommendation 2"],
-    "performance_summary": "Brief explanation of the holistic assessment and trajectory"
+    "performance_summary": "Brief explanation of the holistic assessment"
 }}"""
 
         messages = [
@@ -3816,17 +4097,25 @@ Return ONLY a JSON object:
         old_prof = current_assessment.proficiency
         new_prof = data.get("proficiency", old_prof)
         
+        # Sanity check: Clamp fluency changes to reasonable bounds
+        fluency_delta = new_fluency - old_fluency
+        if abs(fluency_delta) > 10:
+            logger.warning(f"LLM suggested unrealistic fluency change: {fluency_delta:+d}. Clamping to ±5.")
+            new_fluency = old_fluency + max(-5, min(5, fluency_delta))
+        
         logger.debug(f"Fluency: {old_fluency} → {new_fluency} (delta: {new_fluency - old_fluency:+d})")
         logger.debug(f"Proficiency: {old_prof} → {new_prof}")
+        if data.get("fluency_justification"):
+            logger.debug(f"Justification: {data['fluency_justification'][:150]}...")
         if data.get("performance_summary"):
             logger.debug(f"Summary: {data['performance_summary'][:100]}...")
         
-        # Create updated assessment result
+        # Create updated assessment result (using clamped fluency value)
         updated_result = AssessmentResult(
             proficiency=data.get("proficiency", current_assessment.proficiency),
             vocabulary_level=data.get("vocabulary_level", current_assessment.vocabulary_level),
             grammar_level=data.get("grammar_level", current_assessment.grammar_level),
-            fluency_score=data.get("fluency_score", current_assessment.fluency_score),
+            fluency_score=new_fluency,  # Use the clamped value
             strengths=data.get("strengths", current_assessment.strengths),
             weaknesses=data.get("weaknesses", current_assessment.weaknesses),
             recommendations=data.get("recommendations", current_assessment.recommendations),

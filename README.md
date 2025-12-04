@@ -5,7 +5,7 @@ GAIT Language Buddy is an AI-powered language-learning prototype built for the *
 This application provides a comprehensive, multimodal language learning experience:
 
 1. **Assessment** - Determines your proficiency level (A1-C2) through targeted questions
-2. **Personalized Lessons** - 12-card lessons tailored to your level with diverse exercise types
+2. **Personalized Lessons** - 20-card lessons tailored to your level with diverse exercise types
 3. **Visual Learning** - AI-generated images for vocabulary and context
 4. **Audio Practice** - Text-to-speech for listening comprehension and transcription
 5. **Speaking Exercises** - Speech-to-text for pronunciation practice
@@ -155,7 +155,7 @@ service cloud.firestore {
 
 1. **Select Language** - Choose Spanish, French, German, etc.
 2. **Take Assessment** - Answer 3 questions to determine your level
-3. **Complete Lessons** - Work through 12 diverse cards
+3. **Complete Lessons** - Work through 20 diverse cards
 4. **Review Progress** - See your score and vocabulary growth
 5. **Continue Learning** - Each session builds on your history
 

@@ -120,7 +120,65 @@ The lesson card JSON structure supports the following card types:
    Speaking exercises use speech-to-text to transcribe the user's speech and compare
    it to the expected phrase. This tests production of language, not just recognition.
    Keep speaking prompts short and clear (1-2 sentences max for beginners, up to 3 for advanced).
-   Include 1-2 speaking cards per lesson to practice oral production.
+
+9. "reading_comprehension" - Read a passage and answer questions about it
+   {
+     "type": "reading_comprehension",
+     "question": "Main question about the passage (e.g., 'What does María buy at the market?')",
+     "reading_passage": "REQUIRED: A paragraph (3-8 sentences) in the target language to read",
+     "reading_translation": "English translation of the passage (shown after answering)",
+     "reading_questions": [
+       {"question": "Question 1 about the passage", "answer": "Expected answer"},
+       {"question": "Question 2 about the passage", "answer": "Expected answer"}
+     ],
+     "vocabulary_highlights": [
+       {"word": "mercado", "translation": "market"},
+       {"word": "comprar", "translation": "to buy"}
+     ],
+     "correct_answer": "Expected answer to the main question",
+     "feedback": "Feedback explaining the correct answer",
+     "vocabulary_expansion": ["Additional vocabulary from the passage"]
+   }
+   🚨 CRITICAL: reading_passage is REQUIRED - the user needs text to read!
+   Reading comprehension tests understanding of written text. The passage should be
+   appropriate for the learner's level. Include vocabulary highlights for difficult words.
+
+10. "writing_practice" - Free writing exercise with a prompt
+    {
+      "type": "writing_practice",
+      "question": "Write about the following topic:",
+      "writing_prompt": "REQUIRED: The topic/scenario to write about (e.g., 'Describe your typical morning routine')",
+      "instruction": "Write 3-5 sentences describing your morning in [target language]",
+      "writing_min_words": 20,
+      "writing_max_words": 100,
+      "correct_answer": "Example response (for reference)",
+      "feedback": "Feedback will be generated based on their writing",
+      "vocabulary_expansion": ["Helpful vocabulary for this topic"]
+    }
+    🚨 CRITICAL: writing_prompt is REQUIRED - it tells the user what to write about!
+    Writing practice exercises test productive writing ability. Provide clear prompts
+    appropriate for the learner's level.
+
+11. "word_order" - Duolingo-style sentence building exercise
+    {
+      "type": "word_order",
+      "question": "Arrange the words to translate: [English sentence]",
+      "source_sentence": "REQUIRED: The English sentence to translate (e.g., 'I always eat pizza')",
+      "correct_word_order": ["REQUIRED", "list", "of", "words", "in", "correct", "order"],
+      "scrambled_words": ["REQUIRED", "same", "words", "but", "shuffled", "randomly"],
+      "distractor_words": ["optional", "wrong", "words"],
+      "correct_answer": "The complete correct sentence as a string",
+      "feedback": "Feedback on the sentence construction",
+      "vocabulary_expansion": ["Key vocabulary from the sentence"]
+    }
+    🚨 CRITICAL: Both scrambled_words AND correct_word_order are REQUIRED!
+    🚨 scrambled_words provides the clickable word tiles for the user
+    🚨 correct_word_order is used to check their answer
+    Example for German A1:
+      source_sentence: "The dog is big"
+      correct_word_order: ["Der", "Hund", "ist", "groß"]
+      scrambled_words: ["groß", "Hund", "Der", "ist"]
+      correct_answer: "Der Hund ist groß"
 
 All cards should target the learner's proficiency level.
 Images should be used frequently to aid learning.

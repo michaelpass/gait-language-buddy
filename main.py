@@ -100,6 +100,108 @@ logger.banner("GAIT Language Buddy - Starting Application")
 # Scrollable Frame Widget (for cards that may exceed window height)
 # ---------------------------------------------------------------------------
 
+# Global registry for ScrollableFrame instances - enables centralized mousewheel handling
+_scrollable_frames: List["ScrollableFrame"] = []
+_mousewheel_bound = False
+_active_scrollable: Optional["ScrollableFrame"] = None
+
+
+def _set_active_scrollable(frame: Optional["ScrollableFrame"]) -> None:
+    """Set which ScrollableFrame should receive scroll events."""
+    global _active_scrollable
+    _active_scrollable = frame
+
+
+def _setup_global_mousewheel(root: tk.Tk) -> None:
+    """Set up global mousewheel handling once at the application level."""
+    global _mousewheel_bound
+    if _mousewheel_bound:
+        return
+    _mousewheel_bound = True
+    
+    def get_scrollable_from_widget(widget: Optional[tk.Widget]) -> Optional["ScrollableFrame"]:
+        """Traverse up the widget hierarchy to find a ScrollableFrame."""
+        while widget is not None:
+            if isinstance(widget, ScrollableFrame):
+                return widget
+            # Check if this widget is a canvas belonging to a ScrollableFrame
+            for frame in _scrollable_frames:
+                try:
+                    if widget == frame.canvas or widget == frame.content or widget == frame._outer_frame:
+                        return frame
+                except (tk.TclError, AttributeError):
+                    continue
+            try:
+                widget = widget.master
+            except (tk.TclError, AttributeError):
+                break
+        return None
+    
+    def get_active_scrollable(event: tk.Event) -> Optional["ScrollableFrame"]:
+        """Find the ScrollableFrame that should handle this scroll event."""
+        # First, try to find ScrollableFrame from the widget under mouse
+        try:
+            x, y = root.winfo_pointerx(), root.winfo_pointery()
+            widget = root.winfo_containing(x, y)
+            if widget:
+                frame = get_scrollable_from_widget(widget)
+                if frame:
+                    return frame
+        except tk.TclError:
+            pass
+        
+        # Fallback: use the explicitly set active scrollable
+        if _active_scrollable:
+            try:
+                if _active_scrollable.winfo_exists():
+                    return _active_scrollable
+            except tk.TclError:
+                pass
+        
+        # Last resort: find first visible ScrollableFrame
+        for frame in _scrollable_frames:
+            try:
+                if frame.winfo_viewable() and frame.winfo_ismapped():
+                    return frame
+            except tk.TclError:
+                continue
+        return None
+    
+    def on_mousewheel(event: tk.Event) -> Optional[str]:
+        """Global mousewheel handler for Windows/macOS."""
+        frame = get_active_scrollable(event)
+        if frame and event.delta:
+            # macOS has smaller delta values, normalize
+            if abs(event.delta) < 10:
+                scroll_amount = -1 if event.delta > 0 else 1
+            else:
+                scroll_amount = int(-1 * (event.delta / 120))
+            frame.canvas.yview_scroll(scroll_amount, "units")
+            return "break"  # Prevent other widgets from handling
+        return None
+    
+    def on_mousewheel_linux_up(event: tk.Event) -> Optional[str]:
+        """Global mousewheel handler for Linux (scroll up)."""
+        frame = get_active_scrollable(event)
+        if frame:
+            frame.canvas.yview_scroll(-1, "units")
+            return "break"
+        return None
+    
+    def on_mousewheel_linux_down(event: tk.Event) -> Optional[str]:
+        """Global mousewheel handler for Linux (scroll down)."""
+        frame = get_active_scrollable(event)
+        if frame:
+            frame.canvas.yview_scroll(1, "units")
+            return "break"
+        return None
+    
+    # Bind globally at the root level
+    root.bind_all("<MouseWheel>", on_mousewheel)
+    root.bind_all("<Button-4>", on_mousewheel_linux_up)
+    root.bind_all("<Button-5>", on_mousewheel_linux_down)
+
+
 class ScrollableFrame(ttk.Frame):
     """
     A frame that provides vertical scrolling for its content.
@@ -116,6 +218,14 @@ class ScrollableFrame(ttk.Frame):
     
     def __init__(self, parent, **kwargs) -> None:
         super().__init__(parent, **kwargs)
+        
+        # Register this instance for global mousewheel handling
+        _scrollable_frames.append(self)
+        self.bind("<Destroy>", self._on_destroy)
+        
+        # Set this as active when mouse enters or it's mapped
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Map>", self._on_map)
         
         # Track scrollbar visibility and layout state
         self._scrollbar_visible = False
@@ -159,8 +269,22 @@ class ScrollableFrame(ttk.Frame):
         self._outer_frame.bind("<Configure>", self._on_outer_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         
-        # Bind mousewheel scrolling
-        self._bind_mousewheel()
+        # Set up global mousewheel handling (only happens once)
+        _setup_global_mousewheel(self.winfo_toplevel())
+    
+    def _on_destroy(self, event: tk.Event) -> None:
+        """Remove this instance from the global registry when destroyed."""
+        if event.widget == self and self in _scrollable_frames:
+            _scrollable_frames.remove(self)
+    
+    def _on_enter(self, event: tk.Event) -> None:
+        """Set this as the active scrollable when mouse enters."""
+        _set_active_scrollable(self)
+    
+    def _on_map(self, event: tk.Event) -> None:
+        """Set this as the active scrollable when it becomes visible."""
+        if event.widget == self:
+            _set_active_scrollable(self)
     
     def _on_scroll_set(self, first: str, last: str) -> None:
         """Handle scrollbar position updates - show/hide scrollbar dynamically."""
@@ -251,51 +375,6 @@ class ScrollableFrame(ttk.Frame):
                 self._scrollbar_visible = False
         except Exception:
             pass
-    
-    def _bind_mousewheel(self) -> None:
-        """Bind mousewheel events globally for scrolling anywhere in the window."""
-        # Get the root window to bind globally
-        root = self.winfo_toplevel()
-        
-        # Windows and macOS use MouseWheel event
-        root.bind_all("<MouseWheel>", self._on_mousewheel)
-        # Linux uses Button-4 and Button-5
-        root.bind_all("<Button-4>", self._on_mousewheel_linux)
-        root.bind_all("<Button-5>", self._on_mousewheel_linux)
-    
-    def _on_mousewheel(self, event: tk.Event) -> None:
-        """Handle mousewheel on Windows/macOS."""
-        # Only scroll if this ScrollableFrame is currently visible
-        try:
-            if not self.winfo_viewable():
-                return
-        except tk.TclError:
-            return
-        
-        # Scroll regardless of scrollbar visibility - canvas handles bounds
-        if event.delta:
-            # macOS has smaller delta values, normalize
-            if abs(event.delta) < 10:
-                # macOS trackpad - delta is usually 1-5
-                scroll_amount = -1 if event.delta > 0 else 1
-            else:
-                # Windows/macOS mouse wheel - delta is usually 120
-                scroll_amount = int(-1 * (event.delta / 120))
-            self.canvas.yview_scroll(scroll_amount, "units")
-    
-    def _on_mousewheel_linux(self, event: tk.Event) -> None:
-        """Handle mousewheel on Linux."""
-        # Only scroll if this ScrollableFrame is currently visible
-        try:
-            if not self.winfo_viewable():
-                return
-        except tk.TclError:
-            return
-        
-        if event.num == 4:
-            self.canvas.yview_scroll(-1, "units")
-        elif event.num == 5:
-            self.canvas.yview_scroll(1, "units")
     
     def scroll_to_top(self) -> None:
         """Scroll content to top and re-center."""
@@ -4422,8 +4501,19 @@ class LessonCardView(ttk.Frame):
         passage_frame = ttk.LabelFrame(self.answer_frame, text="📖 Reading Passage", padding=10)
         passage_frame.pack(fill="x", pady=(0, 15))
         
-        # Display passage
-        passage_text = card.reading_passage or "No passage provided."
+        # Display passage - check if we have one
+        passage_text = card.reading_passage
+        if not passage_text:
+            # Try to construct from other available fields
+            if card.audio_text:
+                passage_text = card.audio_text
+                logger.warning("Reading comprehension missing reading_passage - using audio_text")
+            elif card.correct_answer:
+                passage_text = f"[Passage text not provided]\n\nExpected answer: {card.correct_answer}"
+                logger.warning("Reading comprehension missing reading_passage - showing correct_answer hint")
+            else:
+                passage_text = "⚠️ No passage was provided for this reading exercise. Please skip to continue."
+                logger.error("Reading comprehension card has no passage!")
         passage_label = tk.Text(
             passage_frame,
             wrap="word",
@@ -4656,6 +4746,29 @@ class LessonCardView(ttk.Frame):
             import random
             scrambled = list(card.correct_word_order)
             random.shuffle(scrambled)
+        
+        # Fallback: if still no scrambled words, try to extract from correct_answer
+        if not scrambled and card.correct_answer:
+            import random
+            # Split the correct answer into words
+            scrambled = card.correct_answer.split()
+            random.shuffle(scrambled)
+            logger.warning(f"Word order card missing scrambled_words - extracted from correct_answer: {scrambled}")
+        
+        # Final fallback: show error message if no words available
+        if not scrambled:
+            logger.error("Word order card has no words to display!")
+            # Show a message to the user
+            error_label = ttk.Label(
+                self.answer_frame,
+                text="⚠️ This exercise is missing word data. Please skip to continue.",
+                font=("Helvetica", 12),
+                foreground="#ff6b6b",
+                wraplength=500,
+            )
+            error_label.pack(pady=20)
+            self.answer_frame.grid()
+            return
         
         self.word_order_widget.set_words(scrambled, source, distractors)
         self.word_order_widget.pack(fill="x", pady=(10, 10))

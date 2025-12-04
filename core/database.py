@@ -1124,20 +1124,40 @@ class DatabaseClient:
         """
         Calculate current and longest streak from session records.
         
+        Uses the user's local timezone to determine calendar days.
+        This ensures that practicing at 11pm and 1am local time on the same
+        calendar day counts as one day, not two.
+        
         Returns:
             Tuple of (current_streak, longest_streak)
         """
         if not sessions:
             return 0, 0
         
-        # Extract unique dates from sessions
+        # Get local timezone for accurate calendar day calculation
+        try:
+            from datetime import timezone as tz
+            import time
+            # Get local timezone offset
+            if time.daylight and time.localtime().tm_isdst > 0:
+                local_offset = timedelta(seconds=-time.altzone)
+            else:
+                local_offset = timedelta(seconds=-time.timezone)
+            local_tz = tz(local_offset)
+        except Exception:
+            # Fallback to UTC if timezone detection fails
+            local_tz = timezone.utc
+        
+        # Extract unique LOCAL dates from sessions
         session_dates = set()
         for session in sessions:
             try:
-                # Parse the ISO timestamp and extract the date
+                # Parse the ISO timestamp
                 if session.started_at:
                     dt = datetime.fromisoformat(session.started_at.replace('Z', '+00:00'))
-                    session_dates.add(dt.date())
+                    # Convert to local timezone before extracting date
+                    local_dt = dt.astimezone(local_tz)
+                    session_dates.add(local_dt.date())
             except Exception:
                 continue
         
@@ -1146,9 +1166,11 @@ class DatabaseClient:
         
         # Sort dates in descending order (most recent first)
         sorted_dates = sorted(session_dates, reverse=True)
-        today = datetime.now(timezone.utc).date()
         
-        # Calculate current streak (consecutive days from today or yesterday)
+        # Use LOCAL today for comparison
+        today = datetime.now(local_tz).date()
+        
+        # Calculate current streak (consecutive calendar days from today or yesterday)
         current_streak = 0
         expected_date = today
         
@@ -1166,24 +1188,28 @@ class DatabaseClient:
             elif date < expected_date:
                 break
         
-        # Calculate longest streak
+        # Calculate longest streak by counting consecutive calendar days
         longest_streak = 0
         streak = 0
         prev_date = None
         
-        for date in sorted(session_dates):
+        for date in sorted(session_dates):  # Ascending order
             if prev_date is None:
                 streak = 1
             elif (date - prev_date).days == 1:
+                # Consecutive day - extend streak
                 streak += 1
             elif (date - prev_date).days > 1:
+                # Gap in days - record streak and start new one
                 longest_streak = max(longest_streak, streak)
                 streak = 1
+            # If (date - prev_date).days == 0, same day - skip (shouldn't happen with set)
             prev_date = date
         
+        # Don't forget the final streak
         longest_streak = max(longest_streak, streak, current_streak)
         
-        logger.debug(f"[DB] Streak calculation: {len(session_dates)} unique days, current={current_streak}, longest={longest_streak}")
+        logger.debug(f"[DB] Streak calculation (local tz): {len(session_dates)} unique days, current={current_streak}, longest={longest_streak}")
         
         return current_streak, longest_streak
     
