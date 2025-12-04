@@ -171,12 +171,25 @@ def _setup_global_mousewheel(root: tk.Tk) -> None:
         """Global mousewheel handler for Windows/macOS."""
         frame = get_active_scrollable(event)
         if frame and event.delta:
-            # macOS has smaller delta values, normalize
+            # Smooth scrolling: scroll by a percentage of the visible area
+            # This makes scrolling feel consistent regardless of content size
+            
+            # Determine scroll direction and magnitude
             if abs(event.delta) < 10:
-                scroll_amount = -1 if event.delta > 0 else 1
+                # macOS trackpad - smooth scrolling with small deltas
+                # Scale up for smoother feel (each gesture = ~3% of viewport)
+                scroll_fraction = -0.03 if event.delta > 0 else 0.03
             else:
-                scroll_amount = int(-1 * (event.delta / 120))
-            frame.canvas.yview_scroll(scroll_amount, "units")
+                # Mouse wheel (Windows/macOS) - larger deltas (typically 120)
+                # Each click = ~5% of viewport
+                scroll_fraction = -0.05 * (event.delta / 120)
+            
+            # Get current scroll position and apply fraction-based scroll
+            current = frame.canvas.yview()
+            new_pos = current[0] + scroll_fraction
+            # Clamp to valid range [0, 1]
+            new_pos = max(0.0, min(1.0, new_pos))
+            frame.canvas.yview_moveto(new_pos)
             return "break"  # Prevent other widgets from handling
         return None
     
@@ -184,7 +197,10 @@ def _setup_global_mousewheel(root: tk.Tk) -> None:
         """Global mousewheel handler for Linux (scroll up)."""
         frame = get_active_scrollable(event)
         if frame:
-            frame.canvas.yview_scroll(-1, "units")
+            # Scroll up by 5% of viewport
+            current = frame.canvas.yview()
+            new_pos = max(0.0, current[0] - 0.05)
+            frame.canvas.yview_moveto(new_pos)
             return "break"
         return None
     
@@ -192,7 +208,10 @@ def _setup_global_mousewheel(root: tk.Tk) -> None:
         """Global mousewheel handler for Linux (scroll down)."""
         frame = get_active_scrollable(event)
         if frame:
-            frame.canvas.yview_scroll(1, "units")
+            # Scroll down by 5% of viewport
+            current = frame.canvas.yview()
+            new_pos = min(1.0, current[0] + 0.05)
+            frame.canvas.yview_moveto(new_pos)
             return "break"
         return None
     
