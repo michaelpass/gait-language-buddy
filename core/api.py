@@ -27,7 +27,7 @@ from openai import OpenAI
 
 from .models import (
     SceneInfo, TextAnalysis, LessonPlan, LessonCard, 
-    AssessmentResult, AssessmentCard
+    AssessmentResult, AssessmentCard, TeachingCard, TeachingPlan
 )
 from .schemas import LESSON_CARD_SCHEMA, ASSESSMENT_CARD_SCHEMA
 from .logger import logger, Timer
@@ -959,12 +959,12 @@ def generate_lesson_plan(analysis: TextAnalysis, scene_description: str) -> Less
 
 def generate_assessment_cards(language: str) -> List[AssessmentCard]:
     """
-    Generate 3 assessment cards for initial language fluency evaluation.
+    Generate 10-12 comprehensive assessment cards for initial language fluency evaluation.
     
-    Returns a list of 3 AssessmentCard objects with different question types
-    to assess vocabulary, grammar, and comprehension.
+    Returns a list of AssessmentCard objects with varied question types
+    to thoroughly assess vocabulary, grammar, comprehension, and fluency.
     """
-    logger.separator(f"Generating Assessment Cards for {language}")
+    logger.separator(f"Generating Comprehensive Assessment Cards for {language}")
     logger.api(f"generate_assessment_cards() called for language: {language}")
     
     if client is None:
@@ -976,63 +976,97 @@ def generate_assessment_cards(language: str) -> List[AssessmentCard]:
             {
                 "role": "system",
                 "content": (
-                    "You are an expert language assessment designer. Create a 3-stage "
-                    "fluency assessment to determine a learner's proficiency level.\n\n"
-                    "IMPORTANT: Create RANDOM and VARIED assessment questions each time. "
-                    "Do NOT use the same examples (like 'red apple'). Use diverse subjects: "
-                    "animals, objects, scenes, activities, food, nature, etc.\n\n"
-                    "CRITICAL LANGUAGE RULE: ALL questions, instructions, and prompts MUST be written in ENGLISH. "
-                    "The learner's responses should be in the target language, but all UI text you provide "
-                    "(questions, instructions, feedback) must be in English. This is essential because learners "
-                    "may be beginners and would find questions in the target language intimidating.\n\n"
-                    f"{ASSESSMENT_CARD_SCHEMA}\n\n"
-                    "Return ONLY a JSON object with this structure:\n"
+                    "You are an expert language assessment designer. Create a COMPREHENSIVE 10-12 question "
+                    "fluency assessment to accurately determine a learner's proficiency level (A1-C2).\n\n"
+                    
+                    "CRITICAL FIELD REQUIREMENTS - READ CAREFULLY:\n"
+                    "The 'question' field is what the user sees as the MAIN PROMPT. It must contain ALL "
+                    "the information they need to answer. Never leave it vague or generic.\n\n"
+                    
+                    "CARD TYPE SPECIFICATIONS:\n\n"
+                    
+                    "1. FOR 'fill_in_blank' TYPE:\n"
+                    f"   - 'question' MUST contain the ACTUAL SENTENCE in {language} with ______ for the blank\n"
+                    "   - Example: 'Ich habe ______ Hund.' (I have a dog)\n"
+                    "   - Example: 'Elle ______ au marché.' (She goes to the market)\n"
+                    "   - 'instruction' explains what to fill in: 'Fill in the blank with the correct article'\n"
+                    "   - 'correct_answer' is just the word(s) for the blank: 'einen' or 'va'\n"
+                    "   - The English translation in parentheses helps the user understand context\n\n"
+                    
+                    "2. FOR 'text_question' TYPE:\n"
+                    "   - 'question' is the complete prompt the user must respond to\n"
+                    "   - Example: 'How do you say \"Good morning, how are you?\" in Spanish?'\n"
+                    "   - Example: 'Write a sentence describing what you did yesterday.'\n"
+                    "   - 'instruction' provides additional guidance if needed\n"
+                    "   - 'correct_answer' is an example of a correct response\n\n"
+                    
+                    "3. FOR 'image_question' TYPE:\n"
+                    f"   - 'question' asks about the image: 'What do you see? Describe it in {language}.'\n"
+                    "   - 'image_prompt' describes what image to generate (REQUIRED)\n"
+                    "   - 'instruction' tells how detailed the response should be\n"
+                    "   - 'correct_answer' describes expected content\n\n"
+                    
+                    "LANGUAGE RULES:\n"
+                    "- 'instruction' is ALWAYS in English\n"
+                    f"- 'question' can include {language} text (especially for fill_in_blank sentences)\n"
+                    "- Include English translations in parentheses for context\n"
+                    f"- 'correct_answer' should be in {language}\n\n"
+                    
+                    "RETURN THIS EXACT JSON STRUCTURE:\n"
                     "{\n"
                     '  "assessment_cards": [\n'
                     "    {\n"
                     '      "stage": 1,\n'
                     '      "type": "image_question",\n'
-                    '      "question": "...",\n'
-                    '      "image_prompt": "...",\n'
-                    '      "correct_answer": "...",\n'
-                    '      ... (other fields based on type)\n'
+                    f'      "question": "What is this object? Write the word in {language}.",\n'
+                    '      "instruction": "Look at the image and write just the word for what you see.",\n'
+                    '      "image_prompt": "a simple red apple on white background, clear educational style",\n'
+                    f'      "correct_answer": "[word for apple in {language}]",\n'
+                    '      "alternatives": ["[any acceptable variations]"]\n'
                     "    },\n"
                     "    {\n"
                     '      "stage": 2,\n'
-                    "      ...\n"
+                    '      "type": "fill_in_blank",\n'
+                    f'      "question": "[ACTUAL SENTENCE IN {language.upper()} WITH ______ BLANK] (English translation)",\n'
+                    '      "instruction": "Fill in the blank with the correct verb/article/word.",\n'
+                    '      "correct_answer": "[the word that fills the blank]",\n'
+                    '      "alternatives": ["[acceptable variations]"]\n'
                     "    },\n"
-                    "    {\n"
-                    '      "stage": 3,\n'
-                    "      ...\n"
-                    "    }\n"
+                    "    ... (10-12 cards total)\n"
                     "  ]\n"
                     "}\n\n"
-                    "Stage 1: A vivid image-based question that contains multiple objects/actions so learners must describe more than a single noun.\n"
-                    "Stage 2: Grammar-focused fill-in-the-blank or sentence transformation question that requires using correct articles, cases, verb conjugations, or word order. Learner must answer via typed text (NO multiple choice).\n"
-                    "Stage 3: A descriptive prompt that asks for 2–3 sentences analysing a situation, preference, or opinion to assess writing fluency and vocabulary range.\n"
-                    f"All content should be appropriate for {language} learners at various levels.\n\n"
-                    "ADDITIONAL REQUIREMENTS:\n"
-                    "- Do NOT output 'multiple_choice' cards for assessments. Use text-based responses only.\n"
-                    "- Prompts must be rich enough to allow the learner to demonstrate grammar and vocabulary (e.g., include multiple subjects/objects, spatial relations, opinions, tense changes).\n"
-                    "- If a question uses a blank, ensure the correct answer and alternative acceptable answers reflect realistic language usage and, for languages with cases (like German), specify the required case/gender.\n"
-                    "- Prefer language-ability checks (grammar, vocabulary, comprehension) over general trivia.\n\n"
-                    "IMPORTANT: Image prompts must be:\n"
-                    "- Educational and appropriate for all ages\n"
-                    "- Simple, clear, and safe (e.g., 'a red apple', 'a friendly cat', 'a sunny park')\n"
-                    "- Avoid any violence, weapons, adult content, or controversial topics\n"
-                    "- Focus on everyday objects, animals, food, nature, or simple scenes\n"
-                    "- Use descriptive but safe language (e.g., 'a cozy café', 'a beautiful garden')\n"
-                    "- VARY THE SUBJECTS - use different objects, animals, scenes each time"
+                    
+                    "ASSESSMENT STRUCTURE (progressive difficulty):\n"
+                    "Stages 1-3 (Beginner A1-A2): Basic vocabulary, simple words, numbers, greetings\n"
+                    "Stages 4-6 (Elementary A2-B1): Basic grammar, articles, simple sentences, common phrases\n"
+                    "Stages 7-9 (Intermediate B1-B2): Complex grammar, verb conjugation, tenses, descriptions\n"
+                    "Stages 10-12 (Advanced B2-C2): Hypotheticals, abstract concepts, extended writing\n\n"
+                    
+                    f"LANGUAGE-SPECIFIC FOR {language.upper()}:\n"
+                    "- Include grammar features specific to this language (gender, cases, verb forms)\n"
+                    "- Use culturally relevant vocabulary and scenarios\n"
+                    "- Test features that distinguish proficiency levels in this language\n\n"
+                    
+                    "CRITICAL REMINDERS:\n"
+                    "- NEVER leave 'question' as just 'Fill in the blank' - include the ACTUAL sentence!\n"
+                    "- NEVER leave 'question' empty or generic\n"
+                    "- ALWAYS provide concrete, complete content the user can respond to\n"
+                    "- VARY the subjects: animals, food, travel, family, work, hobbies, etc."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Generate a 3-stage assessment for {language} learners. "
-                    "Use image-based prompts with multiple elements/actions so the learner must use detailed descriptions, "
-                    "and ensure EVERY response is typed (no multiple choice buttons). Vary the question types "
-                    "to comprehensively assess vocabulary, grammar, and fluency. For languages with grammatical gender or cases "
-                    "(e.g., German), explicitly require correct article/case usage in at least one stage."
+                    f"Generate a comprehensive 10-12 question assessment for {language} learners.\n\n"
+                    "IMPORTANT: For EVERY fill_in_blank question, the 'question' field MUST contain "
+                    f"the actual sentence in {language} with a ______ blank, plus an English translation "
+                    "in parentheses. For example:\n"
+                    "'Er ______ jeden Tag zur Arbeit. (He goes to work every day.)'\n\n"
+                    "For text_question types, the 'question' must clearly state what the user should write.\n"
+                    "For image_question types, include an image_prompt describing what to show.\n\n"
+                    "Make questions progressively harder from basic vocabulary to complex grammar. "
+                    f"Include grammar features specific to {language}. "
+                    "NEVER leave any question vague or missing content."
                 ),
             },
         ]
@@ -1053,13 +1087,13 @@ def generate_assessment_cards(language: str) -> List[AssessmentCard]:
         
         logger.debug(f"Received {len(card_data_list)} assessment cards from API")
         
-        if len(card_data_list) < 3:
+        if len(card_data_list) < 8:
             logger.warning(f"Only {len(card_data_list)} cards received, using fallback")
             return _assessment_cards_fallback(language)
         
-        # Convert JSON to AssessmentCard objects
+        # Convert JSON to AssessmentCard objects (take up to 12 cards)
         assessment_cards = []
-        for i, card_data in enumerate(card_data_list[:3], 1):
+        for i, card_data in enumerate(card_data_list[:12], 1):
             lesson_card = _json_to_lesson_card(card_data)
             assessment_card = AssessmentCard(
                 stage=card_data.get("stage", i),
@@ -1068,7 +1102,7 @@ def generate_assessment_cards(language: str) -> List[AssessmentCard]:
             assessment_cards.append(assessment_card)
             logger.debug(f"Assessment card {i}: type={lesson_card.type}, has_image={bool(lesson_card.image_prompt)}")
         
-        logger.success(f"Generated {len(assessment_cards)} assessment cards successfully")
+        logger.success(f"Generated {len(assessment_cards)} comprehensive assessment cards")
         return assessment_cards
     
     except Exception as e:
@@ -1077,39 +1111,155 @@ def generate_assessment_cards(language: str) -> List[AssessmentCard]:
 
 
 def _assessment_cards_fallback(language: str) -> List[AssessmentCard]:
-    """Fallback assessment cards when API is unavailable."""
+    """Fallback assessment cards when API is unavailable - comprehensive 10-question assessment."""
+    
+    # Language-specific content
+    content = {
+        "Spanish": {
+            "apple": "manzana",
+            "numbers": "uno, dos, tres, cuatro, cinco",
+            "greeting": "Hola, me llamo...",
+            "fill1_q": "Yo ______ estudiante. (I am a student)",
+            "fill1_a": "soy",
+            "fill1_alt": ["soy un", "soy una"],
+            "bathroom": "¿Dónde está el baño?",
+            "fill2_q": "Ayer yo ______ al supermercado. (Yesterday I went to the supermarket)",
+            "fill2_a": "fui",
+        },
+        "French": {
+            "apple": "pomme",
+            "numbers": "un, deux, trois, quatre, cinq",
+            "greeting": "Bonjour, je m'appelle...",
+            "fill1_q": "Je ______ étudiant. (I am a student)",
+            "fill1_a": "suis",
+            "fill1_alt": ["suis un", "suis une"],
+            "bathroom": "Où sont les toilettes?",
+            "fill2_q": "Hier, je ______ au supermarché. (Yesterday I went to the supermarket)",
+            "fill2_a": "suis allé",
+        },
+        "German": {
+            "apple": "Apfel",
+            "numbers": "eins, zwei, drei, vier, fünf",
+            "greeting": "Hallo, ich heiße...",
+            "fill1_q": "Ich ______ Student. (I am a student)",
+            "fill1_a": "bin",
+            "fill1_alt": ["bin ein"],
+            "bathroom": "Wo ist die Toilette?",
+            "fill2_q": "Gestern ______ ich zum Supermarkt gegangen. (Yesterday I went to the supermarket)",
+            "fill2_a": "bin",
+        },
+    }
+    
+    # Default to Spanish-style if language not found
+    lang_content = content.get(language, content["Spanish"])
+    
     cards = [
+        # BEGINNER PROBING (Stages 1-3)
         AssessmentCard(
             stage=1,
             card=LessonCard(
                 type="image_question",
-                question="Beschreibe das Bild mit mindestens zwei Sätzen." if language == "German" else "Describe what is happening in this scene using at least two sentences.",
-                instruction="Mention the people, objects, and actions you observe.",
-                image_prompt="a lively open-air farmer's market in Europe with several stalls of colorful produce, people chatting, a baker handing bread to a customer, and children playing nearby",
-                correct_answer="Learner should describe multiple elements of the market scene with complete sentences.",
-                feedback="Use full sentences, correct articles, and verbs that match the actions in the scene.",
+                question=f"What is this object? Write the word in {language}.",
+                instruction="Look at the image and write just the single word for what you see.",
+                image_prompt="a simple red apple on a white background, clear and educational",
+                correct_answer=lang_content["apple"],
+                feedback="Basic vocabulary identification.",
             )
         ),
         AssessmentCard(
             stage=2,
             card=LessonCard(
-                type="fill_in_blank",
-                question="Ich gebe ______ Frau die Blumen, weil sie heute Geburtstag hat." if language == "German" else "Complete the sentence with the correct case-sensitive phrase.",
-                instruction="Provide the full phrase that correctly completes the sentence (e.g., 'der netten'). Include the correct article, case, and adjective ending.",
-                correct_answer="der netten" if language == "German" else "the correct case-marked phrase",
-                alternatives=["der lieben", "der freundlichen"] if language == "German" else [],
-                feedback="Pay attention to dative case articles/adjective endings when indicating 'to the woman'.",
+                type="text_question",
+                question=f"Write the numbers 1 through 5 in {language}, spelled out as words.",
+                instruction="Write each number word separated by commas (e.g., one, two, three...).",
+                correct_answer=lang_content["numbers"],
+                feedback="Basic number knowledge.",
             )
         ),
         AssessmentCard(
             stage=3,
             card=LessonCard(
                 type="text_question",
-                question="Vergleiche zwei Reiseziele, die du gerne besuchen würdest, und erkläre warum." if language == "German" else "Compare two travel destinations you would like to visit and explain why in 3–4 sentences.",
-                instruction="Use connectors (weil, obwohl / because, however, therefore) and describe preferences in detail.",
-                image_prompt="a split scene showing a snowy mountain village on the left and a sunny seaside town on the right, both with detailed elements",
-                correct_answer="Learner should provide a multi-sentence comparison demonstrating grammar and vocabulary.",
-                feedback="Use comparative structures and give reasons or opinions to demonstrate fluency.",
+                question=f"How do you say 'Hello, my name is [your name]' in {language}? Write the complete greeting.",
+                instruction="Write the full sentence as you would introduce yourself.",
+                correct_answer=lang_content["greeting"],
+                feedback="Basic greeting construction.",
+            )
+        ),
+        # ELEMENTARY PROBING (Stages 4-6)
+        AssessmentCard(
+            stage=4,
+            card=LessonCard(
+                type="fill_in_blank",
+                question=lang_content["fill1_q"],
+                instruction="Fill in the blank with the correct form of the verb 'to be'.",
+                correct_answer=lang_content["fill1_a"],
+                alternatives=lang_content["fill1_alt"],
+                feedback="Basic verb conjugation.",
+            )
+        ),
+        AssessmentCard(
+            stage=5,
+            card=LessonCard(
+                type="image_question",
+                question=f"Describe what you see in this image. Write 2-3 sentences in {language}.",
+                instruction="Mention the animal, what it's doing, and where it is.",
+                image_prompt="a friendly golden retriever dog playing with a red ball in a sunny green park",
+                correct_answer="Description of dog playing with ball in park.",
+                feedback="Basic descriptive sentences.",
+            )
+        ),
+        AssessmentCard(
+            stage=6,
+            card=LessonCard(
+                type="text_question",
+                question=f"How would you ask 'Where is the bathroom?' in {language}? Write the complete question.",
+                instruction="Write the question as you would ask it to someone.",
+                correct_answer=lang_content["bathroom"],
+                feedback="Common phrase usage.",
+            )
+        ),
+        # INTERMEDIATE PROBING (Stages 7-9)
+        AssessmentCard(
+            stage=7,
+            card=LessonCard(
+                type="fill_in_blank",
+                question=lang_content["fill2_q"],
+                instruction="Fill in the blank with the correct past tense verb form.",
+                correct_answer=lang_content["fill2_a"],
+                feedback="Past tense conjugation.",
+            )
+        ),
+        AssessmentCard(
+            stage=8,
+            card=LessonCard(
+                type="image_question",
+                question=f"Describe this busy scene in detail. Write at least 4 sentences in {language}.",
+                instruction="Describe the people, what they're doing, the objects, and the setting.",
+                image_prompt="a lively outdoor European cafe with people eating at tables, a waiter carrying drinks, and a street musician playing guitar nearby",
+                correct_answer="Detailed description with multiple elements and actions.",
+                feedback="Complex scene description.",
+            )
+        ),
+        AssessmentCard(
+            stage=9,
+            card=LessonCard(
+                type="text_question",
+                question=f"What is your favorite food and why do you like it? Write 3-4 sentences in {language}.",
+                instruction="Express your opinion and give at least two reasons. Use connecting words like 'because', 'also', 'and'.",
+                correct_answer="Opinion with reasoning using appropriate connectors.",
+                feedback="Opinion expression with connectors.",
+            )
+        ),
+        # ADVANCED PROBING (Stage 10)
+        AssessmentCard(
+            stage=10,
+            card=LessonCard(
+                type="text_question",
+                question=f"If you could travel anywhere in the world, where would you go and what would you do there? Write 4-5 sentences in {language}.",
+                instruction="Use conditional structures (if/would) and describe your imaginary trip in detail.",
+                correct_answer="Hypothetical scenario using conditional tense with detailed description.",
+                feedback="Conditional/subjunctive usage.",
             )
         ),
     ]
@@ -1121,7 +1271,8 @@ def evaluate_assessment_responses(
     assessment_responses: List[Dict[str, Any]]
 ) -> AssessmentResult:
     """
-    Evaluate the 3 assessment responses to determine proficiency level.
+    Evaluate assessment responses to determine proficiency level.
+    This is a DEDICATED evaluation - focused only on analyzing the user's language ability.
     
     Args:
         language: Target language
@@ -1130,51 +1281,176 @@ def evaluate_assessment_responses(
     Returns:
         AssessmentResult with proficiency level and recommendations
     """
+    logger.separator(f"Evaluating Assessment Responses ({language})")
+    logger.api("evaluate_assessment_responses() called")
+    logger.debug(f"Evaluating {len(assessment_responses)} responses")
+    
     if client is None:
+        logger.warning("No API client - using fallback assessment")
         return _assessment_result_fallback()
     
+    # Log full responses for debugging (not truncated!)
+    logger.debug("=" * 60)
+    logger.debug("FULL ASSESSMENT RESPONSES BEING EVALUATED:")
+    logger.debug("=" * 60)
+    for i, resp in enumerate(assessment_responses):
+        logger.debug(f"\n--- Question {i+1} (Stage {resp.get('stage', '?')}) ---")
+        logger.debug(f"Type: {resp.get('card_type', 'unknown')}")
+        logger.debug(f"Question: {resp.get('question', 'N/A')}")
+        logger.debug(f"Instruction: {resp.get('instruction', 'N/A')}")
+        logger.debug(f"USER'S RESPONSE: \"{resp.get('response', '')}\"")
+        logger.debug(f"Expected answer: {resp.get('correct_answer', 'N/A')}")
+    logger.debug("=" * 60)
+    
     try:
+        # Build a detailed evaluation prompt
+        system_prompt = f"""You are an expert {language} language assessor. Your ONLY task is to carefully evaluate a learner's responses and determine their CEFR proficiency level.
+
+CRITICAL: Focus on WHAT THE LEARNER ACTUALLY WROTE, not whether it matches sample answers.
+
+## EVALUATION METHODOLOGY
+
+For each response, analyze:
+
+### 1. GRAMMAR ANALYSIS
+- Verb conjugations (correct person, tense, mood?)
+- Case usage (nominative, accusative, dative, genitive - if applicable)
+- Word order (correct placement of verbs, adjectives, adverbs?)
+- Agreement (gender, number, case agreement?)
+- Complex structures (relative clauses, subordinate clauses, conditionals?)
+
+### 2. VOCABULARY ANALYSIS  
+- Range: Basic everyday words only, or varied/specialized vocabulary?
+- Appropriateness: Words used correctly in context?
+- Sophistication: Simple words (A1-A2) or nuanced vocabulary (B2+)?
+
+### 3. SENTENCE COMPLEXITY
+- A1: Single words, memorized phrases ("Ich bin...", "Das ist...")
+- A2: Simple sentences, basic connectors ("und", "aber", "weil")
+- B1: Compound sentences, multiple clauses, expressing opinions
+- B2: Complex subordination, conditional/subjunctive mood, nuanced expression
+- C1: Sophisticated structures, idiomatic usage, stylistic variation
+- C2: Near-native complexity, subtle distinctions, rare errors
+
+### 4. RESPONSE QUALITY
+- Does the response address the question meaningfully?
+- Is communication successful even if not perfect?
+- Length and detail appropriate to the prompt?
+
+## PROFICIENCY LEVEL GUIDELINES
+
+**A1 (Beginner)**: 
+- Single words or very short phrases
+- Many basic errors
+- Limited to memorized expressions
+- Example: "Ich... Apfel" or "Gut"
+
+**A2 (Elementary)**:
+- Simple sentences with basic structure
+- Common vocabulary, some errors
+- Can describe simple things
+- Example: "Ich sehe ein Apfel auf dem Tisch"
+
+**B1 (Intermediate)**:
+- Connected sentences, can express opinions
+- Multiple tenses used correctly
+- Can discuss familiar topics
+- Example: "In meinem Klassenzimmer gibt es viele Tische. Die Lehrerin steht vor der Tafel."
+
+**B2 (Upper Intermediate)**:
+- Complex sentences with subordination
+- Conditional/subjunctive mood (Konjunktiv II in German)
+- Good vocabulary range, few errors
+- Example: "Wenn ich im Lotto gewinnen würde, würde ich mir ein Haus am Meer kaufen."
+
+**C1 (Advanced)**:
+- Sophisticated sentence structures
+- Idiomatic expressions
+- Subtle nuances, rare errors
+- Example: "Obwohl ich eigentlich keine Zeit hatte, habe ich mich dennoch entschlossen, an der Veranstaltung teilzunehmen."
+
+**C2 (Mastery)**:
+- Near-native fluency
+- Stylistic sophistication
+- Exceptional range and precision
+
+## SCORING GUIDELINES
+
+**Fluency Score (0-100)**:
+- 0-20: Minimal language production, mostly incorrect
+- 21-40: Basic phrases, frequent errors, limited communication
+- 41-60: Functional communication, moderate errors, handles familiar topics
+- 61-80: Good command, occasional errors, can discuss complex topics
+- 81-100: Excellent/near-native, rare errors, sophisticated expression
+
+## CRITICAL RULES
+
+1. **DO NOT penalize for different-but-correct answers!** 
+   - If the question asks "Describe what you see" and the user writes grammatically correct sentences, that's good - even if different from the sample answer.
+
+2. **Look for evidence of ABILITY, not just correctness**
+   - Using Konjunktiv II correctly = B2+ evidence
+   - Using complex subordinate clauses = B1+ evidence  
+   - Using varied vocabulary appropriately = higher level evidence
+
+3. **Evaluate the BEST evidence shown**
+   - If a user shows B2-level grammar in some responses, they're likely B2 even if simpler responses exist
+
+4. **Be generous but accurate**
+   - If unsure between two levels, consider the higher one if there's clear evidence
+
+Return ONLY a JSON object with your evaluation:
+{{
+  "proficiency": "A1|A2|B1|B2|C1|C2",
+  "vocabulary_level": "A1|A2|B1|B2|C1|C2", 
+  "grammar_level": "A1|A2|B1|B2|C1|C2",
+  "fluency_score": 0-100,
+  "strengths": ["specific strength with example from their writing"],
+  "weaknesses": ["specific weakness with example"],
+  "recommendations": ["actionable recommendation"],
+  "evaluation_notes": "Brief explanation of how you determined this level"
+}}"""
+
+        user_content = f"""Please evaluate these {language} assessment responses:
+
+TARGET LANGUAGE: {language}
+NUMBER OF RESPONSES: {len(assessment_responses)}
+
+RESPONSES TO EVALUATE:
+{json.dumps(assessment_responses, ensure_ascii=False, indent=2)}
+
+Remember: Focus on the 'response' field - that's what the learner actually wrote. Evaluate the QUALITY of their {language}, not just whether it matches the expected answer."""
+
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert language assessor. Analyze the learner's responses "
-                    "to a 3-stage language assessment and determine their proficiency level.\n\n"
-                    "Return ONLY a JSON object:\n"
-                    "{\n"
-                    '  "proficiency": "A1|A2|B1|B2|C1|C2",\n'
-                    '  "vocabulary_level": "A1|A2|B1|B2|C1|C2",\n'
-                    '  "grammar_level": "A1|A2|B1|B2|C1|C2",\n'
-                    '  "fluency_score": 0-100,\n'
-                    '  "strengths": ["strength 1", "strength 2"],\n'
-                    '  "weaknesses": ["weakness 1", "weakness 2"],\n'
-                    '  "recommendations": ["recommendation 1", "recommendation 2"]\n'
-                    "}"
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "target_language": language,
-                        "assessment_responses": assessment_responses,
-                    },
-                    ensure_ascii=False,
-                ),
-            },
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
         ]
         
-        completion = client.chat.completions.create(
-            model=DEFAULT_CHAT_MODEL,
-            response_format={"type": "json_object"},
-            messages=messages,
-            temperature=0.3,
-        )
+        logger.api_call("chat.completions.create (assessment evaluation)", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.3,  # Lower temperature for more consistent evaluation
+                max_tokens=1500,
+            )
+        logger.api_response("chat.completions.create (assessment)", duration_ms=timer.duration_ms)
         
         raw = completion.choices[0].message.content
         data = json.loads(raw)
         
-        return AssessmentResult(
+        # Log the evaluation result
+        logger.debug("=" * 60)
+        logger.debug("ASSESSMENT EVALUATION RESULT:")
+        logger.debug(f"  Proficiency: {data.get('proficiency', 'A1')}")
+        logger.debug(f"  Vocabulary: {data.get('vocabulary_level', 'A1')}")
+        logger.debug(f"  Grammar: {data.get('grammar_level', 'A1')}")
+        logger.debug(f"  Fluency Score: {data.get('fluency_score', 0)}")
+        logger.debug(f"  Evaluation Notes: {data.get('evaluation_notes', 'N/A')}")
+        logger.debug("=" * 60)
+        
+        result = AssessmentResult(
             proficiency=data.get("proficiency", "A1"),
             vocabulary_level=data.get("vocabulary_level", "A1"),
             grammar_level=data.get("grammar_level", "A1"),
@@ -1183,8 +1459,12 @@ def evaluate_assessment_responses(
             weaknesses=data.get("weaknesses", []) or [],
             recommendations=data.get("recommendations", []) or [],
         )
+        
+        logger.success(f"Assessment complete: {result.proficiency} level, {result.fluency_score}/100 fluency")
+        return result
     
-    except Exception:
+    except Exception as e:
+        logger.error(f"Assessment evaluation failed: {e}")
         return _assessment_result_fallback()
 
 
@@ -1257,224 +1537,140 @@ def _json_to_lesson_card(card_data: Dict[str, Any]) -> LessonCard:
 
 def generate_lesson_plan_from_assessment_responses(
     assessment_responses: List[Dict[str, Any]],
-    language: str
+    language: str,
+    learner_context: Optional[str] = None
 ) -> tuple:
     """
-    Generate assessment result AND lesson plan in ONE API call for lowest latency.
-    This combines what used to be two separate API calls into one.
+    Generate assessment result AND lesson plan in TWO SEPARATE API calls.
+    First evaluates the assessment, then generates lessons based on the result.
+    
+    Args:
+        assessment_responses: List of assessment response dictionaries
+        language: Target language
+        learner_context: Optional learner profile context string from database
     
     Returns:
         Tuple of (AssessmentResult, LessonPlan)
     """
-    logger.separator(f"Generating Lesson Plan from Assessment ({language})")
+    logger.separator(f"Assessment & Lesson Generation ({language})")
     logger.api("generate_lesson_plan_from_assessment_responses() called")
     logger.debug(f"Processing {len(assessment_responses)} assessment responses")
     
     if client is None:
-        logger.warning("Using fallback lesson plan (no API)")
+        logger.warning("Using fallback (no API)")
         assessment_result = _assessment_result_fallback()
         return assessment_result, _structured_lesson_plan_fallback(assessment_result, language)
     
-    try:
-        logger.api("Evaluating assessment responses and generating lesson plan...")
-        
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert language assessor and tutor. You will analyze the learner's "
-                    "assessment responses to determine their proficiency level, then generate lessons "
-                    "targeted specifically at that proficiency level.\n\n"
-                    "STEP 1 - ASSESSMENT:\n"
-                    "Analyze the assessment_responses provided. Determine the learner's:\n"
-                    "- Overall proficiency level (A1, A2, B1, B2, C1, or C2)\n"
-                    "- Vocabulary level\n"
-                    "- Grammar level\n"
-                    "- Fluency score (0-100)\n"
-                    "- Strengths and weaknesses\n"
-                    "- Recommendations for improvement\n\n"
-                    "STEP 2 - LESSON GENERATION:\n"
-                    "Based on the proficiency level determined in Step 1, create lesson content "
-                    "EXACTLY at that level. For example:\n"
-                    "- A1 level: Basic vocabulary, simple sentences, present tense only\n"
-                    "- A2 level: Common phrases, past/present tenses, simple descriptions\n"
-                    "- B1 level: Complex sentences, multiple tenses, abstract concepts\n"
-                    "- B2 level: Nuanced language, conditional/subjunctive, detailed analysis\n"
-                    "- C1/C2 level: Advanced vocabulary, idiomatic expressions, sophisticated grammar\n\n"
-                    "The lesson content difficulty MUST match the assessed proficiency level.\n\n"
-                    f"{LESSON_CARD_SCHEMA}\n\n"
-                    "Return ONLY a JSON object:\n"
-                    "{\n"
-                    '  "assessment": {\n'
-                    '    "proficiency": "A1|A2|B1|B2|C1|C2",\n'
-                    '    "vocabulary_level": "A1|A2|B1|B2|C1|C2",\n'
-                    '    "grammar_level": "A1|A2|B1|B2|C1|C2",\n'
-                    '    "fluency_score": 0-100,\n'
-                    '    "strengths": ["strength 1"],\n'
-                    '    "weaknesses": ["weakness 1"],\n'
-                    '    "recommendations": ["recommendation 1"]\n'
-                    '  },\n'
-                    '  "lesson_cards": [\n'
-                    "    {\n"
-                    '      "type": "multiple_choice",\n'
-                    '      "question": "...",\n'
-                    '      "options": ["Option text only, no A/B/C prefixes"],\n'
-                    '      "correct_index": 0,\n'
-                    '      "image_prompt": "...",\n'
-                    '      "feedback": "...",\n'
-                    '      "vocabulary_expansion": [...]\n'
-                    "    },\n"
-                    "    ... (exactly 12 cards)\n"
-                    "  ]\n"
-                    "}\n\n"
-                    "Requirements:\n"
-                    "- FIRST: Analyze assessment responses to determine proficiency level\n"
-                    "- THEN: Create exactly 12 diverse lesson cards AT that proficiency level\n"
-                    "- Use a mix of card types: multiple_choice, fill_in_blank, image_question, vocabulary, audio_transcription, audio_comprehension, speaking\n"
-                    "- Include image_prompts for visual cards (at least 5 out of 12)\n"
-                    "- IMPORTANT: Include 2-3 AUDIO cards (audio_transcription or audio_comprehension) to develop listening skills\n"
-                    "- IMPORTANT: Include 1-2 SPEAKING cards where the user speaks a phrase and it's transcribed\n"
-                    "- CRITICAL: Lesson difficulty must match the assessed proficiency level exactly\n"
-                    "- Every card MUST focus on building LANGUAGE SKILLS (grammar practice, vocabulary usage, sentence construction, comprehension, speaking/writing prompts, pronunciation cues, etc.). Avoid pure trivia like geography/history unless it explicitly requires using the target language.\n"
-                    "- Each card should have feedback and vocabulary_expansion\n"
-                    "- IMPORTANT: Lessons should be INDEPENDENT and can be completed in any order.\n"
-                    "- Each lesson card should be self-contained - don't reference previous cards.\n\n"
-                    "AUDIO CARD REQUIREMENTS:\n"
-                    "- audio_transcription: Short 1-3 sentences in the target language for dictation practice\n"
-                    "  - audio_text must be in " + language + " (target language)\n"
-                    "  - correct_answer should match audio_text exactly\n"
-                    "  - Instruction in English: 'Listen to the audio and write what you hear.'\n"
-                    "- audio_comprehension: Longer passage (paragraph) with comprehension question\n"
-                    "  - audio_text: 3-6 sentences in " + language + " telling a story or describing a situation\n"
-                    "  - question: Ask about the content IN ENGLISH\n"
-                    "  - correct_answer: The answer (can be in " + language + " or English depending on question)\n"
-                    "- For beginners (A1-A2): Simple sentences, slow pacing, common vocabulary\n"
-                    "- For intermediate (B1-B2): Complex sentences, natural pacing, varied vocabulary\n"
-                    "- For advanced (C1-C2): Native-speed, idioms, sophisticated structures\n\n"
-                    "SPEAKING CARD REQUIREMENTS:\n"
-                    "- speaking: User records themselves saying a phrase, which is transcribed and compared\n"
-                    "  - speaking_prompt: The phrase the user should say in " + language + "\n"
-                    "  - correct_answer: Same as speaking_prompt\n"
-                    "  - instruction: 'Say the following phrase out loud:' (in English)\n"
-                    "  - alternatives: Acceptable variations of the phrase\n"
-                    "- For beginners (A1-A2): Simple greetings, numbers, basic vocabulary (1 sentence)\n"
-                    "- For intermediate (B1-B2): Common phrases, short sentences (1-2 sentences)\n"
-                    "- For advanced (C1-C2): Complex sentences, idioms (2-3 sentences)\n\n"
-                    "CRITICAL LANGUAGE RULES (PROFICIENCY-BASED):\n"
-                    "- For BEGINNERS (A1-A2 proficiency): ALL questions and instructions MUST be in ENGLISH.\n"
-                    "  This is essential because beginners would find questions in the target language intimidating.\n"
-                    f"  Example: Question='What is the word for \"dog\" in {language}?'\n"
-                    f"- For INTERMEDIATE/ADVANCED (B1, B2, C1, C2 proficiency): Questions and instructions should be in {language} (the target language).\n"
-                    f"  This provides immersive practice. Example: Question in {language} asking about vocabulary or grammar.\n"
-                    "- IMPORTANT: Determine the question language based on the assessed proficiency level:\n"
-                    "  * A1, A2 → Questions in ENGLISH\n"
-                    f"  * B1, B2, C1, C2 → Questions in {language}\n"
-                    f"- The learner's expected answers should ALWAYS be in {language} (target language)\n"
-                    f"- Multiple choice OPTIONS should ALWAYS be in {language}\n"
-                    f"- audio_text MUST ALWAYS be in {language} (it will be converted to speech)\n"
-                    "- Feedback text should ALWAYS be in ENGLISH (to ensure comprehension)\n\n"
-                    "CRITICAL RULES:\n"
-                    "- For multiple_choice: Do NOT include letter prefixes (A, B, C, D) in option text.\n"
-                    "  Just provide plain option text like: ['quadratisch', 'rund', 'dreieckig']\n\n"
-                    "CRITICAL: Image prompts MUST be safe and educational:\n"
-                    "- Use simple, everyday objects and scenes (e.g., 'a red apple on a white table', 'a friendly dog playing', 'a sunny beach with palm trees')\n"
-                    "- Avoid: violence, weapons, adult content, controversial topics\n"
-                    "- Focus on: food, animals, nature, everyday objects, simple activities, educational scenes"
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "target_language": language,
-                        "assessment_responses": assessment_responses,
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ]
-        
-        logger.api_call("chat.completions.create (combined assessment+lesson)", model=DEFAULT_CHAT_MODEL)
-        with Timer() as timer:
-            completion = client.chat.completions.create(
-                model=DEFAULT_CHAT_MODEL,
-                response_format={"type": "json_object"},
-                messages=messages,
-                temperature=0.7,
-                max_tokens=4000,  # Limit tokens for faster response (assessment + 10 lesson cards)
-            )
-        logger.api_response("chat.completions.create", duration_ms=timer.duration_ms)
-        
-        raw = completion.choices[0].message.content
-        data = json.loads(raw)
-        
-        # Extract assessment result
-        logger.debug("Extracting assessment result from response...")
-        assessment_data = data.get("assessment", {})
-        assessment_result = AssessmentResult(
-            proficiency=assessment_data.get("proficiency", "A1"),
-            vocabulary_level=assessment_data.get("vocabulary_level", "A1"),
-            grammar_level=assessment_data.get("grammar_level", "A1"),
-            fluency_score=int(assessment_data.get("fluency_score", 0)),
-            strengths=assessment_data.get("strengths", []) or [],
-            weaknesses=assessment_data.get("weaknesses", []) or [],
-            recommendations=assessment_data.get("recommendations", []) or [],
-        )
-        logger.success(f"Assessment result: proficiency={assessment_result.proficiency}, "
-                      f"fluency_score={assessment_result.fluency_score}")
-        
-        # Extract lesson cards
-        logger.debug("Processing lesson cards...")
-        card_data_list = data.get("lesson_cards", []) or []
-        if not card_data_list:
-            logger.warning("No lesson cards in response, using fallback")
-            lesson_plan = _structured_lesson_plan_fallback(assessment_result, language)
-        else:
-            cards = []
-            for i, card_data in enumerate(card_data_list[:12], 1):
-                cards.append(_json_to_lesson_card(card_data))
-            logger.debug(f"Processed {len(cards)} lesson cards")
-            
-            lesson_plan = LessonPlan(
-                cards=cards,
-                proficiency_target=assessment_result.proficiency
-            )
-        
-        # Count cards with images
-        cards_with_images = sum(1 for c in lesson_plan.cards if c.image_prompt)
-        logger.success(f"Lesson plan generated: {len(lesson_plan.cards)} cards, "
-                      f"{cards_with_images} with images")
-        return assessment_result, lesson_plan
+    # STEP 1: Evaluate assessment with dedicated, focused API call
+    logger.separator("Step 1: Assessment Evaluation")
+    assessment_result = evaluate_assessment_responses(language, assessment_responses)
     
-    except Exception as e:
-        logger.api_error(f"Combined assessment+lesson generation failed: {e}", exc_info=True)
-        assessment_result = _assessment_result_fallback()
-        return assessment_result, _structured_lesson_plan_fallback(assessment_result, language)
+    # STEP 2: Generate lessons based on the evaluated proficiency
+    logger.separator("Step 2: Lesson Generation")
+    logger.api(f"Generating lessons for {assessment_result.proficiency} level learner...")
+    
+    lesson_plan = generate_structured_lesson_plan(
+        assessment_result=assessment_result,
+        language=language,
+        learner_context=learner_context
+    )
+    
+    logger.success(f"Complete! Assessment: {assessment_result.proficiency}, Lessons: {len(lesson_plan.cards)} cards")
+    return assessment_result, lesson_plan
+
 
 
 def generate_structured_lesson_plan(
     assessment_result: AssessmentResult,
-    language: str
+    language: str,
+    learner_context: Optional[str] = None,
+    teaching_plan: Optional[TeachingPlan] = None
 ) -> LessonPlan:
     """
-    Generate a 10-card structured lesson plan based on assessment results.
+    Generate a 12-card quiz based on assessment results and teaching content.
     
     Uses structured JSON format to create varied lesson cards including
     multiple choice, fill-in-blank, image questions, etc.
+    
+    The quiz cards should primarily test vocabulary and concepts from the 
+    teaching phase, plus reinforce existing knowledge from the learner's history.
+    
+    Args:
+        assessment_result: The learner's assessment result
+        language: Target language
+        learner_context: Optional learner profile context string from database
+        teaching_plan: Optional TeachingPlan with vocabulary/grammar taught this session
     """
     logger.api(f"generate_structured_lesson_plan() for {language}, proficiency={assessment_result.proficiency}")
+    if learner_context:
+        logger.debug(f"Including learner context ({len(learner_context)} chars)")
+    if teaching_plan:
+        logger.debug(f"Including teaching content: {len(teaching_plan.cards)} cards")
     
     if client is None:
         logger.warning("Using fallback lesson plan (no API)")
         return _structured_lesson_plan_fallback(assessment_result, language)
     
+    # Build teaching content context if available
+    teaching_context = ""
+    if teaching_plan and teaching_plan.cards:
+        taught_vocabulary = []
+        taught_grammar = []
+        taught_phrases = []
+        
+        for card in teaching_plan.cards:
+            if card.type == "vocabulary_intro" and card.word:
+                taught_vocabulary.append({
+                    "word": card.word,
+                    "translation": card.translation,
+                    "example": card.example_sentence,
+                    "is_new": card.is_new,
+                })
+            elif card.type == "grammar_lesson" and card.grammar_rule:
+                taught_grammar.append({
+                    "rule": card.grammar_rule,
+                    "explanation": card.explanation[:200] if card.explanation else "",
+                })
+            elif card.type == "phrase_lesson" and card.word:
+                taught_phrases.append({
+                    "phrase": card.word,
+                    "translation": card.translation,
+                    "usage": card.explanation[:100] if card.explanation else "",
+                })
+        
+        teaching_context = f"""
+═══════════════════════════════════════════════════════════════════
+VOCABULARY & CONCEPTS TAUGHT THIS SESSION (TEST THESE!)
+═══════════════════════════════════════════════════════════════════
+
+Theme: {teaching_plan.theme or 'General'}
+New words introduced: {teaching_plan.new_words_count}
+Review words: {teaching_plan.review_words_count}
+
+VOCABULARY TO TEST (the user just learned these):
+{json.dumps(taught_vocabulary, ensure_ascii=False, indent=2)}
+
+GRAMMAR CONCEPTS TO TEST:
+{json.dumps(taught_grammar, ensure_ascii=False, indent=2)}
+
+PHRASES TO TEST:
+{json.dumps(taught_phrases, ensure_ascii=False, indent=2)}
+
+CRITICAL: At least 70% of quiz questions should test the vocabulary and grammar 
+concepts listed above. The user JUST learned these, so the quiz should reinforce them.
+═══════════════════════════════════════════════════════════════════
+"""
+        logger.debug(f"Teaching context: {len(taught_vocabulary)} vocab, {len(taught_grammar)} grammar, {len(taught_phrases)} phrases")
+    
     try:
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are an expert language tutor. Create a personalized 10-card "
-                    "lesson plan based on the learner's assessment results.\n\n"
+                    "You are an expert language tutor creating a QUIZ to test what the learner just studied.\n\n"
+                    "IMPORTANT: This quiz should primarily test vocabulary and concepts that were JUST TAUGHT "
+                    "in the teaching phase (provided below). The learner has just reviewed these words/concepts, "
+                    "so the quiz reinforces their learning.\n\n"
                     f"{LESSON_CARD_SCHEMA}\n\n"
                     "Return ONLY a JSON object:\n"
                     "{\n"
@@ -1492,14 +1688,30 @@ def generate_structured_lesson_plan(
                     "  ]\n"
                     "}\n\n"
                     "Requirements:\n"
-                    "- Create exactly 12 diverse lesson cards\n"
-                    "- Use a mix of card types: multiple_choice, fill_in_blank, image_question, vocabulary, audio_transcription, audio_comprehension, speaking\n"
+                    "- Create exactly 12 quiz cards\n"
+                    "- **CRITICAL**: At least 8-10 cards should test vocabulary/grammar from the TEACHING CONTENT below\n"
+                    "- The remaining 2-4 cards can test general knowledge at the learner's level\n"
+                    "- Use a mix of card types: multiple_choice, fill_in_blank, image_question, text_question, audio_transcription, audio_comprehension, speaking\n"
                     "- Include image_prompts for visual cards (at least 5 out of 12)\n"
                     "- IMPORTANT: Include 2-3 AUDIO cards (audio_transcription or audio_comprehension) to develop listening skills\n"
                     "- IMPORTANT: Include 1-2 SPEAKING cards where the user speaks a phrase and it's transcribed\n"
                     "- Target the learner's proficiency level\n"
                     "- Each card should have feedback and vocabulary_expansion\n"
-                    "- Vary difficulty slightly but keep it appropriate for the level\n\n"
+                    "- Vary question formats but keep testing the TAUGHT vocabulary\n\n"
+                    "**CRITICAL - EVERY CARD MUST BE TESTABLE**:\n"
+                    "- EVERY card MUST have a clear question that requires the user to provide an answer\n"
+                    "- Do NOT create cards that just display information (those are teaching cards, not quiz cards)\n"
+                    "- Do NOT use 'vocabulary' type for quiz cards - use multiple_choice, fill_in_blank, or text_question instead\n"
+                    "- Each card must have: a question/prompt, a correct_answer, and a way for the user to respond\n"
+                    "- Examples of GOOD quiz cards:\n"
+                    "  - multiple_choice: 'What is the German word for apple?' with options\n"
+                    "  - fill_in_blank: 'Ich ___ müde.' (correct_answer: 'bin')\n"
+                    "  - text_question: 'Translate: The house is big' (correct_answer: 'Das Haus ist groß')\n"
+                    "  - image_question: Show an image, ask 'What is this in German?'\n"
+                    "- Examples of BAD quiz cards (DO NOT DO):\n"
+                    "  - Just showing a word and translation (that's teaching, not testing)\n"
+                    "  - Cards without a question field\n"
+                    "  - Cards where the user doesn't need to respond\n\n"
                     "AUDIO CARD REQUIREMENTS:\n"
                     "- audio_transcription: Short 1-3 sentences in the target language for dictation practice\n"
                     f"  - audio_text must be in {language} (target language)\n"
@@ -1546,6 +1758,19 @@ def generate_structured_lesson_plan(
                     "- Avoid: violence, weapons, adult content, controversial topics, anything inappropriate\n"
                     "- Focus on: food, animals, nature, everyday objects, simple activities, educational scenes\n"
                     "- Keep prompts clear, descriptive, and suitable for language learning contexts"
+                    + (
+                        f"\n\n{teaching_context}"
+                        if teaching_context else ""
+                    )
+                    + (
+                        f"\n\n{learner_context}\n\n"
+                        "PERSONALIZATION INSTRUCTIONS:\n"
+                        "- Review the learner profile above to understand their history\n"
+                        "- Include weak vocabulary words from the database in the quiz to reinforce them\n"
+                        "- But prioritize testing the TAUGHT vocabulary from this session\n"
+                        "- Create progressively challenging content based on their recent performance"
+                        if learner_context else ""
+                    )
                 ),
             },
             {
@@ -1723,6 +1948,570 @@ def _structured_lesson_plan_fallback(
         prompt_idx += 1
     
     return LessonPlan(cards=cards[:12], proficiency_target=assessment_result.proficiency)
+
+
+# ---------------------------------------------------------------------------
+# Teaching Content Generation
+# ---------------------------------------------------------------------------
+
+TEACHING_CARD_SCHEMA = """
+TEACHING CARD TYPES:
+
+1. vocabulary_intro - Introduce a new word
+   Required fields:
+   - title: "New Word: [word]" or similar
+   - word: The word in target language (e.g., "der Apfel")
+   - translation: English translation (e.g., "the apple")
+   - part_of_speech: "noun", "verb", "adjective", etc.
+   - gender: For gendered languages (e.g., "masculine" for German)
+   - explanation: English explanation with context and usage
+   - example_sentence: Example in target language
+   - example_translation: English translation of example
+   - pronunciation_hint: Phonetic guide or pronunciation tip
+   - mnemonic: Optional memory aid
+   - image_prompt: A simple image to illustrate the word
+   - audio_text: The word/phrase for TTS (same as 'word')
+   - related_words: 1-3 related words
+   - is_new: true if new word, false if review
+
+2. grammar_lesson - Teach a grammar concept
+   Required fields:
+   - title: "Grammar: [concept]"
+   - grammar_rule: The rule being taught
+   - explanation: Clear English explanation
+   - grammar_examples: Array of {"target": "...", "english": "..."} examples
+   - common_mistakes: Common errors to avoid
+   - audio_text: A key example sentence for TTS
+
+3. phrase_lesson - Teach a common phrase or expression
+   Required fields:
+   - title: "Phrase: [phrase type]"
+   - word: The full phrase
+   - translation: English meaning
+   - explanation: When/how to use it
+   - example_sentence: Example in context
+   - example_translation: English translation
+   - audio_text: The phrase for TTS
+
+4. concept_review - Review previously learned content
+   - Same structure as vocabulary_intro or phrase_lesson
+   - is_review: true
+   - is_new: false
+"""
+
+
+def generate_teaching_batch(
+    language: str,
+    proficiency: str,
+    batch_type: str,  # "vocabulary", "grammar", "review"
+    num_cards: int = 5,
+    theme: Optional[str] = None,
+    learner_context: Optional[str] = None,
+    existing_words: Optional[List[str]] = None,  # Words already generated (avoid duplicates)
+) -> List[TeachingCard]:
+    """
+    Generate a small batch of teaching cards quickly.
+    
+    This is designed for progressive loading - call multiple times with different
+    batch_types to build up a complete lesson.
+    
+    Args:
+        language: Target language
+        proficiency: CEFR level
+        batch_type: "vocabulary" (new words), "grammar", or "review"
+        num_cards: How many cards in this batch (default 5)
+        theme: Optional theme
+        learner_context: User's learning history
+        existing_words: Words already generated to avoid duplicates
+    
+    Returns:
+        List of TeachingCard objects
+    """
+    logger.api(f"generate_teaching_batch({batch_type}) - {num_cards} cards")
+    
+    if client is None:
+        return []
+    
+    try:
+        # Simpler, focused prompt for faster generation
+        type_instructions = {
+            "vocabulary": f"""Generate {num_cards} NEW vocabulary cards. Include a MIX of nouns and VERBS.
+
+For VERBS: After each verb card, include a "conjugation_table" card showing:
+- All present tense conjugations (ich, du, er/sie/es, wir, ihr, sie/Sie for German, etc.)
+- 2-3 example sentences using different conjugations
+
+This means if you include 2 verbs, you'll have 2 verb cards + 2 conjugation cards.""",
+            "grammar": f"Generate {num_cards} grammar lesson cards explaining key {proficiency} level grammar concepts.",
+            "review": f"Generate {num_cards} REVIEW cards for common {proficiency} level vocabulary.",
+        }
+        
+        avoid_words = ""
+        if existing_words:
+            avoid_words = f"\n\nDO NOT include these words (already generated): {', '.join(existing_words[:20])}"
+        
+        conjugation_schema = """
+For VERB cards (part_of_speech: "verb"), ALWAYS follow with a conjugation_table card:
+{
+  "type": "conjugation_table",
+  "title": "Conjugation: [infinitive]",
+  "infinitive": "gehen",
+  "translation": "to go",
+  "tense": "Present",
+  "verb_type": "irregular",
+  "conjugations": {
+    "ich": "gehe",
+    "du": "gehst", 
+    "er/sie/es": "geht",
+    "wir": "gehen",
+    "ihr": "geht",
+    "sie/Sie": "gehen"
+  },
+  "conjugation_examples": [
+    {"sentence": "Ich gehe zur Schule.", "translation": "I go to school."},
+    {"sentence": "Du gehst ins Kino.", "translation": "You go to the cinema."},
+    {"sentence": "Wir gehen zusammen.", "translation": "We go together."}
+  ],
+  "explanation": "This verb is irregular. Note the stem change in du/er forms."
+}
+"""
+        
+        system_prompt = f"""Generate teaching cards for {proficiency} level {language} learners.
+{type_instructions.get(batch_type, type_instructions["vocabulary"])}
+{avoid_words}
+
+{conjugation_schema if batch_type == "vocabulary" else ""}
+
+Return ONLY JSON: {{"cards": [...]}}
+Each card needs: type, title, word, translation, explanation, example_sentence, example_translation, image_prompt, audio_text, is_new, is_review, difficulty_level, part_of_speech.
+{f'Theme: {theme}' if theme else ''}"""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Generate {num_cards} {batch_type} cards now."},
+        ]
+        
+        logger.api_call(f"chat.completions.create (teaching_batch_{batch_type})", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.7,
+                max_tokens=2000,  # Smaller for faster response
+            )
+        logger.api_response(f"teaching_batch_{batch_type}", duration_ms=timer.duration_ms)
+        
+        raw = completion.choices[0].message.content
+        data = json.loads(raw)
+        cards_data = data.get("cards", data.get("teaching_cards", []))
+        
+        cards = []
+        for card_data in cards_data:
+            card = _json_to_teaching_card(card_data)
+            # Set batch type flags
+            if batch_type == "vocabulary":
+                card.is_new = True
+                card.is_review = False
+            elif batch_type == "review":
+                card.is_new = False
+                card.is_review = True
+            cards.append(card)
+        
+        logger.success(f"Batch complete: {len(cards)} {batch_type} cards")
+        return cards
+        
+    except Exception as e:
+        logger.api_error(f"Teaching batch failed: {e}")
+        return []
+
+
+def generate_teaching_content(
+    language: str,
+    proficiency: str,
+    learner_context: Optional[str] = None,
+    num_new_words: int = 12,
+    num_review_words: int = 5,
+    theme: Optional[str] = None,
+    on_batch_ready: Optional[Callable[[List[TeachingCard], int, int], None]] = None,
+) -> TeachingPlan:
+    """
+    Generate teaching content (vocabulary, grammar, phrases) for a lesson.
+    
+    This creates educational cards that TEACH new content before the quiz.
+    The cards have multimedia support (images, audio) and clear explanations.
+    
+    If on_batch_ready is provided, generates content in batches and calls the callback
+    after each batch for progressive UI updates.
+    
+    Args:
+        language: Target language (e.g., "German")
+        proficiency: CEFR level (A1, A2, B1, B2, C1, C2)
+        learner_context: User's learning history from database
+        num_new_words: How many new words to introduce (default 12)
+        num_review_words: How many known words to review (default 5)
+        theme: Optional theme for the lesson (e.g., "Food", "Travel")
+        on_batch_ready: Optional callback(cards, batch_num, total_batches) for progressive loading
+    
+    Returns:
+        TeachingPlan with vocabulary, grammar, and phrase cards
+    """
+    logger.separator(f"Generating Teaching Content ({language}, {proficiency})")
+    logger.api(f"generate_teaching_content() - {num_new_words} new, {num_review_words} review")
+    
+    if client is None:
+        logger.warning("No API client - using fallback teaching content")
+        return _teaching_content_fallback(language, proficiency)
+    
+    # Use batched generation for progressive loading
+    if on_batch_ready:
+        return _generate_teaching_content_batched(
+            language, proficiency, learner_context,
+            num_new_words, num_review_words, theme, on_batch_ready
+        )
+    
+    # Original single-call approach (still available for backward compatibility)
+    try:
+        # Determine appropriate content complexity based on proficiency
+        content_guidance = {
+            "A1": "Very basic vocabulary: colors, numbers 1-10, greetings, family members, common objects. Simple present tense only.",
+            "A2": "Everyday vocabulary: food, weather, hobbies, basic verbs. Present and simple past tenses.",
+            "B1": "Intermediate vocabulary: emotions, opinions, travel, work. Past, present, future tenses. Introduction to subjunctive.",
+            "B2": "Advanced vocabulary: abstract concepts, idioms, business terms. Complex tenses, conditional mood.",
+            "C1": "Sophisticated vocabulary: nuanced expressions, formal language, specialized terms. All tenses and moods.",
+            "C2": "Near-native vocabulary: rare words, literary expressions, subtle distinctions. Stylistic variation.",
+        }
+        
+        level_guidance = content_guidance.get(proficiency, content_guidance["A1"])
+        
+        system_prompt = f"""You are an expert {language} language teacher creating educational content.
+
+Your task is to generate TEACHING cards that introduce and explain new vocabulary, grammar, and phrases.
+These cards will be shown to learners BEFORE they are tested - this is the learning phase.
+
+TARGET LEVEL: {proficiency}
+LEVEL GUIDANCE: {level_guidance}
+
+{TEACHING_CARD_SCHEMA}
+
+REQUIREMENTS:
+1. Generate {num_new_words} NEW vocabulary/phrase cards (is_new: true)
+2. Generate {num_review_words} REVIEW cards (is_review: true) - common words at this level that reinforce learning
+3. Include 2-3 GRAMMAR cards that explain key grammar points at this level
+4. Total cards should be around {num_new_words + num_review_words + 3}
+
+CONTENT GUIDELINES FOR {proficiency}:
+- All explanations in ENGLISH (clear and helpful)
+- All examples and target content in {language}
+- Vocabulary appropriate for {proficiency} level
+- Grammar concepts appropriate for {proficiency} level
+
+CARD DESIGN:
+- Each card should be self-contained and educational
+- Include image_prompt for vocabulary cards (simple, clear images)
+- Include audio_text for TTS pronunciation (the word/phrase in {language})
+- Include mnemonic or memory aids where helpful
+- Show related words to build vocabulary networks
+
+{f'THEME: Focus on vocabulary related to "{theme}"' if theme else 'Choose a cohesive theme (e.g., food, daily routine, travel)'}
+
+{learner_context if learner_context else ''}
+{f"PERSONALIZATION: Use the learner context above to include words they need to review (weak vocabulary) and avoid words they've mastered." if learner_context else ""}
+
+Return ONLY a JSON object:
+{{
+  "theme": "the theme of this lesson",
+  "teaching_cards": [
+    {{
+      "type": "vocabulary_intro",
+      "title": "New Word: der Hund",
+      "word": "der Hund",
+      "translation": "the dog",
+      "part_of_speech": "noun",
+      "gender": "masculine",
+      "explanation": "This is a common noun for a dog. In German, all nouns are capitalized and have a gender...",
+      "example_sentence": "Der Hund spielt im Garten.",
+      "example_translation": "The dog plays in the garden.",
+      "pronunciation_hint": "hoont (the 'u' sounds like 'oo' in 'book')",
+      "mnemonic": "Think of a dog 'hounding' you for treats!",
+      "image_prompt": "a friendly golden retriever dog sitting",
+      "audio_text": "der Hund",
+      "related_words": ["die Katze (cat)", "das Tier (animal)"],
+      "is_new": true,
+      "is_review": false,
+      "difficulty_level": "A1"
+    }},
+    // ... more cards
+  ]
+}}"""
+
+        user_content = f"""Generate teaching content for a {proficiency} level {language} learner.
+
+Create:
+- {num_new_words} new vocabulary/phrase cards
+- {num_review_words} review cards  
+- 2-3 grammar lesson cards
+
+Make the content engaging, educational, and appropriate for the {proficiency} level.
+{f'Focus on the theme: {theme}' if theme else 'Choose a cohesive theme like food, daily activities, or travel.'}"""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        
+        logger.api_call("chat.completions.create (teaching_content)", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.7,
+                max_tokens=6000,  # Teaching content needs more tokens
+            )
+        logger.api_response("chat.completions.create (teaching)", duration_ms=timer.duration_ms)
+        
+        raw = completion.choices[0].message.content
+        data = json.loads(raw)
+        
+        # Parse teaching cards
+        cards_data = data.get("teaching_cards", [])
+        theme = data.get("theme", "General Vocabulary")
+        
+        cards = []
+        new_count = 0
+        review_count = 0
+        grammar_concepts = []
+        
+        for card_data in cards_data:
+            card = _json_to_teaching_card(card_data)
+            cards.append(card)
+            
+            if card.is_new:
+                new_count += 1
+            if card.is_review:
+                review_count += 1
+            if card.type == "grammar_lesson" and card.grammar_rule:
+                grammar_concepts.append(card.grammar_rule)
+        
+        logger.success(f"Generated {len(cards)} teaching cards: {new_count} new, {review_count} review, {len(grammar_concepts)} grammar")
+        
+        return TeachingPlan(
+            cards=cards,
+            proficiency_target=proficiency,
+            theme=theme,
+            new_words_count=new_count,
+            review_words_count=review_count,
+            grammar_concepts=grammar_concepts,
+        )
+    
+    except Exception as e:
+        logger.api_error(f"Teaching content generation failed: {e}", exc_info=True)
+        return _teaching_content_fallback(language, proficiency)
+
+
+def _generate_teaching_content_batched(
+    language: str,
+    proficiency: str,
+    learner_context: Optional[str],
+    num_new_words: int,
+    num_review_words: int,
+    theme: Optional[str],
+    on_batch_ready: Callable[[List[TeachingCard], int, int], None],
+) -> TeachingPlan:
+    """
+    Generate teaching content in batches for progressive loading.
+    
+    Calls on_batch_ready after each batch so UI can update progressively.
+    """
+    logger.api("Using batched generation for progressive loading")
+    
+    all_cards: List[TeachingCard] = []
+    generated_words: List[str] = []
+    
+    # Calculate batches: vocab(6), vocab(6), grammar(3), review(5)
+    batches = [
+        ("vocabulary", min(6, num_new_words)),
+        ("vocabulary", max(0, num_new_words - 6)),
+        ("grammar", 3),
+        ("review", num_review_words),
+    ]
+    # Filter out empty batches
+    batches = [(t, n) for t, n in batches if n > 0]
+    total_batches = len(batches)
+    
+    discovered_theme = theme or "Daily Life"
+    
+    for batch_num, (batch_type, num_cards) in enumerate(batches, 1):
+        logger.api(f"Generating batch {batch_num}/{total_batches}: {batch_type} ({num_cards} cards)")
+        
+        cards = generate_teaching_batch(
+            language=language,
+            proficiency=proficiency,
+            batch_type=batch_type,
+            num_cards=num_cards,
+            theme=discovered_theme,
+            learner_context=learner_context if batch_type == "review" else None,
+            existing_words=generated_words,
+        )
+        
+        # Track words to avoid duplicates
+        for card in cards:
+            if card.word:
+                generated_words.append(card.word)
+        
+        all_cards.extend(cards)
+        
+        # Call the callback with progress
+        logger.ui(f"Batch {batch_num}/{total_batches} ready: {len(cards)} {batch_type} cards")
+        on_batch_ready(cards, batch_num, total_batches)
+    
+    # Count totals
+    new_count = sum(1 for c in all_cards if c.is_new)
+    review_count = sum(1 for c in all_cards if c.is_review)
+    grammar_concepts = [c.grammar_rule for c in all_cards if c.type == "grammar_lesson" and c.grammar_rule]
+    
+    logger.success(f"Batched generation complete: {len(all_cards)} cards total")
+    
+    return TeachingPlan(
+        cards=all_cards,
+        proficiency_target=proficiency,
+        theme=discovered_theme,
+        new_words_count=new_count,
+        review_words_count=review_count,
+        grammar_concepts=grammar_concepts,
+    )
+
+
+def _json_to_teaching_card(card_data: Dict[str, Any]) -> TeachingCard:
+    """Convert JSON data to TeachingCard object."""
+    card_type = card_data.get("type", "vocabulary_intro")
+    
+    # Sanitize image prompt if present
+    image_prompt = card_data.get("image_prompt")
+    if image_prompt:
+        image_prompt = sanitize_image_prompt(image_prompt)
+    
+    # Parse grammar examples if present
+    grammar_examples = card_data.get("grammar_examples", []) or []
+    
+    # Parse additional examples if present
+    additional_examples = card_data.get("additional_examples", []) or []
+    
+    # Parse conjugation examples if present
+    conjugation_examples = card_data.get("conjugation_examples", []) or []
+    
+    # Parse conjugations dictionary
+    conjugations = card_data.get("conjugations", {}) or {}
+    
+    return TeachingCard(
+        type=card_type,
+        title=card_data.get("title", ""),
+        explanation=card_data.get("explanation", ""),
+        word=card_data.get("word") or card_data.get("infinitive"),  # Support both
+        translation=card_data.get("translation"),
+        pronunciation_hint=card_data.get("pronunciation_hint"),
+        part_of_speech=card_data.get("part_of_speech"),
+        gender=card_data.get("gender"),
+        plural_form=card_data.get("plural_form"),
+        # Conjugation fields
+        infinitive=card_data.get("infinitive"),
+        conjugations=conjugations,
+        tense=card_data.get("tense"),
+        verb_type=card_data.get("verb_type"),
+        conjugation_examples=conjugation_examples,
+        # Examples
+        example_sentence=card_data.get("example_sentence"),
+        example_translation=card_data.get("example_translation"),
+        additional_examples=additional_examples,
+        grammar_rule=card_data.get("grammar_rule"),
+        grammar_examples=grammar_examples,
+        common_mistakes=card_data.get("common_mistakes", []) or [],
+        related_words=card_data.get("related_words", []) or [],
+        synonyms=card_data.get("synonyms", []) or [],
+        antonyms=card_data.get("antonyms", []) or [],
+        image_prompt=image_prompt,
+        audio_text=card_data.get("audio_text"),
+        is_review=card_data.get("is_review", False),
+        is_new=card_data.get("is_new", True),
+        difficulty_level=card_data.get("difficulty_level", "A1"),
+        mnemonic=card_data.get("mnemonic"),
+        usage_notes=card_data.get("usage_notes"),
+    )
+
+
+def _teaching_content_fallback(language: str, proficiency: str) -> TeachingPlan:
+    """Fallback teaching content when API is unavailable."""
+    logger.warning("Using fallback teaching content")
+    
+    # Language-specific examples
+    examples = {
+        "German": [
+            TeachingCard(
+                type="vocabulary_intro",
+                title="New Word: der Apfel",
+                word="der Apfel",
+                translation="the apple",
+                part_of_speech="noun",
+                gender="masculine",
+                explanation="'Apfel' is a masculine noun in German. Like most fruits, it follows regular declension patterns.",
+                example_sentence="Der Apfel ist rot.",
+                example_translation="The apple is red.",
+                pronunciation_hint="AHP-fell",
+                mnemonic="Think of 'apple' - they sound similar!",
+                image_prompt="a shiny red apple on a white surface",
+                audio_text="der Apfel",
+                related_words=["die Birne (pear)", "die Orange (orange)"],
+                is_new=True,
+                difficulty_level=proficiency,
+            ),
+            TeachingCard(
+                type="grammar_lesson",
+                title="Grammar: German Articles",
+                grammar_rule="German nouns have three genders: masculine (der), feminine (die), and neuter (das)",
+                explanation="Unlike English, German nouns have grammatical gender. You must learn the article with each noun.",
+                grammar_examples=[
+                    {"target": "der Mann", "english": "the man (masculine)"},
+                    {"target": "die Frau", "english": "the woman (feminine)"},
+                    {"target": "das Kind", "english": "the child (neuter)"},
+                ],
+                common_mistakes=["Forgetting to learn the article with the noun", "Assuming gender matches meaning"],
+                audio_text="der, die, das",
+                is_new=True,
+                difficulty_level=proficiency,
+            ),
+        ],
+        "Spanish": [
+            TeachingCard(
+                type="vocabulary_intro",
+                title="New Word: la manzana",
+                word="la manzana",
+                translation="the apple",
+                part_of_speech="noun",
+                gender="feminine",
+                explanation="'Manzana' is a feminine noun in Spanish. Most nouns ending in -a are feminine.",
+                example_sentence="La manzana es roja.",
+                example_translation="The apple is red.",
+                pronunciation_hint="man-SAH-nah",
+                image_prompt="a shiny red apple on a white surface",
+                audio_text="la manzana",
+                related_words=["la pera (pear)", "la naranja (orange)"],
+                is_new=True,
+                difficulty_level=proficiency,
+            ),
+        ],
+    }
+    
+    cards = examples.get(language, examples.get("Spanish", []))
+    
+    return TeachingPlan(
+        cards=cards,
+        proficiency_target=proficiency,
+        theme="Basic Vocabulary",
+        new_words_count=len([c for c in cards if c.is_new]),
+        review_words_count=0,
+        grammar_concepts=["German Articles"] if language == "German" else [],
+    )
 
 
 def evaluate_card_response(

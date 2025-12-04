@@ -1,53 +1,62 @@
 # GAIT Language Buddy
 
-GAIT Language Buddy is an AI-powered language-learning prototype built for the **Generative AI Tools (GAIT)** course project.  
-This application guides a learner through a multimodal workflow:
+GAIT Language Buddy is an AI-powered language-learning prototype built for the **Generative AI Tools (GAIT)** course project.
 
-1. A scene is generated (currently text-based; planned for image generation).  
-2. The learner writes a description in their target language.  
-3. The app evaluates the writing using an OpenAI model.  
-4. A personalized mini-lesson is generated based on learner strengths/weaknesses.  
-5. (Future) The app will produce audio examples and rich multimodal outputs.
+This application provides a comprehensive, multimodal language learning experience:
 
-The user interface is built using **PySimpleGUI** for rapid prototyping and easy team collaboration.
+1. **Assessment** - Determines your proficiency level (A1-C2) through targeted questions
+2. **Personalized Lessons** - 12-card lessons tailored to your level with diverse exercise types
+3. **Visual Learning** - AI-generated images for vocabulary and context
+4. **Audio Practice** - Text-to-speech for listening comprehension and transcription
+5. **Speaking Exercises** - Speech-to-text for pronunciation practice
+6. **Progress Tracking** - Firebase database stores vocabulary strength, grammar progress, and learning history
 
 ---
 
 ## ✨ Features
 
-### ✔ Scene Generation (Text for Now)
-- Provides a simple scene to describe.
-- Will later integrate OpenAI image generation.
+### 🎯 Adaptive Assessment
+- 3-stage assessment to determine CEFR proficiency level (A1-C2)
+- Evaluates vocabulary, grammar, and fluency
+- Identifies strengths and weaknesses
 
-### ✔ LLM-Powered Writing Evaluation
-- Detects grammar/vocabulary issues.
-- Infers CEFR-style proficiency (A1–C2).
-- Provides strengths, weaknesses, suggestions.
+### 📚 Diverse Lesson Types
+- **Multiple Choice** - Test comprehension
+- **Fill in the Blank** - Grammar practice
+- **Image Questions** - Visual vocabulary ("What is this?")
+- **Vocabulary Cards** - Word learning with examples
+- **Audio Transcription** - Listen and write (TTS via OpenAI)
+- **Audio Comprehension** - Listen to passages and answer questions
+- **Speaking Exercises** - Record yourself and get STT feedback
 
-### ✔ LLM-Powered Mini-Lesson
-- Tailored feedback based on the learner’s writing.
-- Includes example sentences and vocabulary suggestions.
+### 🔊 Multimodal Learning
+- **Image Generation** - DALL-E 3 creates contextual images
+- **Text-to-Speech** - Native-quality audio in target language
+- **Speech-to-Text** - Whisper transcribes your speech
 
-### ✔ Graceful Fallbacks
-If the OpenAI API key is missing or a request fails:
-- A rule-based evaluator is used.
-- A rule-based mini-lesson is generated.
-
-This ensures anyone (e.g., classmates) can run the app without an API key.
+### 💾 Progress Persistence (Firebase)
+- Vocabulary tracking with strength ratings
+- Grammar pattern progress
+- Session history
+- Personalized LLM context for evolving lessons
 
 ---
 
 ## 🧱 Project Structure
+
+```
 gait-language-buddy/
-├─ .env                  # Stores OPENAI_API_KEY (ignored by git)
-├─ .gitignore
-├─ README.md
-├─ requirements.txt
-├─ main.py               # PySimpleGUI app controller
-└─ core/
-├─ init.py
-├─ models.py          # Data classes for structured outputs
-└─ api.py             # OpenAI-backed evaluation + mini-lesson logic
+├── .env                  # API keys (create from .env.example)
+├── requirements.txt
+├── main.py               # Tkinter UI application
+└── core/
+    ├── __init__.py
+    ├── models.py         # Data classes (LessonCard, AssessmentResult, etc.)
+    ├── schemas.py        # LLM JSON schemas for card generation
+    ├── api.py            # OpenAI API integration
+    ├── logger.py         # Debug logging utility
+    └── database.py       # Firebase Firestore integration
+```
 
 ---
 
@@ -55,98 +64,162 @@ gait-language-buddy/
 
 ### 1. Clone the repository
 
-```
+```bash
 git clone https://github.com/<your-username>/gait-language-buddy.git
 cd gait-language-buddy
 ```
 
-🖥 Usage Guide
-	1.	Choose your target language.
-	2.	Click New Scene to load a description prompt.
-	3.	Write your paragraph in the target language.
-	4.	Click Evaluate Writing to receive:
-	•	proficiency level
-	•	strengths
-	•	weaknesses
-	•	suggestions
-	•	auto-generated mini-lesson
-	5.	Click Generate Audio (stub; real TTS planned for Phase 2).
+### 2. Install dependencies
 
-⸻
+```bash
+pip install -r requirements.txt
+```
 
-🧪 Tech Stack
-	•	Python 3.10+
-	•	PySimpleGUI for the user interface
-	•	OpenAI API for evaluation and mini-lessons
-	•	python-dotenv for environment variable management
+### 3. Configure environment variables
 
-⸻
+Create a `.env` file in the project root:
 
-🛠 How the Code Works
+```env
+# Required: OpenAI API Key
+# Get yours at: https://platform.openai.com/api-keys
+OPENAI_API_KEY=sk-your-api-key-here
 
-core/models.py
+# Optional: Firebase for progress persistence
+# 1. Create project at: https://console.firebase.google.com/
+# 2. Go to Project Settings > Service Accounts
+# 3. Click "Generate new private key"
+# 4. Save the JSON file and set path below
+FIREBASE_CREDENTIALS_PATH=/path/to/firebase-credentials.json
+```
 
-Contains structured dataclasses:
-	•	TextAnalysis
-	•	MiniLesson
-	•	AudioInfo
+### 4. Run the application
 
-core/api.py
+```bash
+python main.py
+```
 
-Handles:
-	•	environment loading (os.getenv, load_dotenv)
-	•	OpenAI LLM calls
-	•	fallback heuristics when the API isn’t available
+---
 
-main.py
+## 🔥 Firebase Setup (Optional)
 
-Defines:
-	•	the GUI layout
-	•	GUI event loop
-	•	rendering logic for analysis, lessons, audio
+Firebase enables progress tracking across sessions and devices.
 
-⸻
+### Step 1: Create Firebase Project
 
-🌱 Planned Enhancements
+1. Go to [Firebase Console](https://console.firebase.google.com/)
+2. Click "Create a project"
+3. Name it (e.g., "language-buddy")
+4. Disable Google Analytics (optional for prototype)
 
-Phase 2 (Multimodal)
-	•	Real image generation for scene creation
-	•	Real text-to-speech audio output
-	•	Learner speech input + pronunciation evaluation
+### Step 2: Enable Firestore
 
-Phase 3 (Intelligent Tutoring)
-	•	Learner profiles and progress tracking
-	•	Dynamic difficulty adjustment
-	•	Rubric-based CEFR scoring (A1–C2)
-	•	More advanced lesson generation
+1. In your project, go to **Build > Firestore Database**
+2. Click "Create database"
+3. Start in **test mode** for development
+4. Choose a region close to you
 
-⸻
+### Step 3: Generate Service Account Key
 
-👥 Contributors
-	•	Michael Pass
-  •	Dani Perez
-	•	Mishka Mohamed Nour
-  
+1. Go to **Project Settings** (gear icon)
+2. Click **Service accounts** tab
+3. Click **Generate new private key**
+4. Save the JSON file securely
+5. Set `FIREBASE_CREDENTIALS_PATH` in your `.env`
 
-⸻
+### Step 4: Security Rules (Production)
 
-📄 License
+For multi-user production, update Firestore rules:
+
+```javascript
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{userId}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}
+```
+
+---
+
+## 🖥 Usage Guide
+
+1. **Select Language** - Choose Spanish, French, German, etc.
+2. **Take Assessment** - Answer 3 questions to determine your level
+3. **Complete Lessons** - Work through 12 diverse cards
+4. **Review Progress** - See your score and vocabulary growth
+5. **Continue Learning** - Each session builds on your history
+
+---
+
+## 🧪 Tech Stack
+
+- **Python 3.10+**
+- **Tkinter** - Cross-platform UI
+- **OpenAI API** - GPT-4o-mini, DALL-E 3, Whisper, TTS
+- **Firebase Firestore** - Cloud database
+- **pygame** - Audio playback
+- **sounddevice/soundfile** - Audio recording
+
+---
+
+## 📊 Database Schema
+
+### User Profile
+```json
+{
+  "user_id": "default_user",
+  "display_name": "Language Learner",
+  "active_languages": ["Spanish"],
+  "primary_language": "Spanish"
+}
+```
+
+### Language Profile
+```json
+{
+  "language": "Spanish",
+  "overall_proficiency": "A2",
+  "vocabulary_level": "A2",
+  "grammar_level": "A1",
+  "fluency_score": 65,
+  "strengths": ["Basic greetings", "Present tense"],
+  "weaknesses": ["Gender agreement", "Ser vs Estar"],
+  "total_sessions": 5,
+  "current_streak_days": 3
+}
+```
+
+### Vocabulary Item
+```json
+{
+  "word": "manzana",
+  "translation": "apple",
+  "times_seen": 8,
+  "times_correct": 6,
+  "strength_score": 75,
+  "strength_rating": "familiar",
+  "example_sentences": ["La manzana es roja."]
+}
+```
+
+---
+
+## 👥 Contributors
+
+- Michael Pass
+- Dani Perez
+- Mishka Mohamed Nour
+
+---
+
+## 📄 License
 
 This project is currently for academic use within the GAIT course.
-A standard license (MIT/GPL/etc.) may be added later based on team preference.
 
-⸻
+---
 
-🎓 Instructor Notes (Optional Section)
-
-This project is designed as a demonstration of:
-	•	multimodal LLM interactions
-	•	stateful evaluation over multiple steps
-	•	GUI-backed applications using OpenAI APIs
-	•	safe development patterns with fallbacks
-
-⸻
-
-🙌 Acknowledgments
+## 🙌 Acknowledgments
 
 Thanks to the GAIT course faculty for guidance and inspiration in applied multimodal AI.

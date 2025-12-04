@@ -26,7 +26,7 @@ from tkinter import ttk, messagebox
 import threading
 import os
 
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set, Callable
 
 from PIL import Image, ImageTk
 
@@ -41,15 +41,27 @@ except ImportError:
     print("Install with: pip install pygame")
 
 # Audio recording support for speaking exercises
+RECORDING_AVAILABLE = False
+RECORDING_ERROR = None
 try:
     import sounddevice as sd
     import soundfile as sf
     import tempfile
-    RECORDING_AVAILABLE = True
-except ImportError:
-    RECORDING_AVAILABLE = False
-    print("Note: sounddevice/soundfile not installed. Recording will be disabled.")
-    print("Install with: pip install sounddevice soundfile")
+    # Test that we can actually access audio devices
+    devices = sd.query_devices()
+    input_devices = [d for d in devices if d['max_input_channels'] > 0]
+    if len(input_devices) == 0:
+        RECORDING_ERROR = "No microphone found. Check System Preferences → Privacy → Microphone"
+        print(f"Note: {RECORDING_ERROR}")
+    else:
+        RECORDING_AVAILABLE = True
+        print(f"✓ Recording available: {len(input_devices)} microphone(s) found")
+except ImportError as e:
+    RECORDING_ERROR = f"Missing packages: {e}. Install with: pip install sounddevice soundfile"
+    print(f"Note: {RECORDING_ERROR}")
+except Exception as e:
+    RECORDING_ERROR = f"Audio device error: {e}. On macOS, try: brew install portaudio"
+    print(f"Note: {RECORDING_ERROR}")
 
 from core.logger import logger
 from core.api import (
@@ -59,6 +71,7 @@ from core.api import (
     evaluate_assessment_responses,
     generate_structured_lesson_plan,
     generate_lesson_plan_from_assessment_responses,  # Optimized combined function
+    generate_teaching_content,  # Teaching content generation
     evaluate_card_response,
     generate_final_summary,
     generate_image_async,
@@ -66,8 +79,16 @@ from core.api import (
     generate_speech_async,  # TTS generation
     transcribe_audio_async,  # STT transcription
 )
+from core.database import (
+    initialize_database,
+    get_db,
+    VocabularyItem,
+    SessionRecord,
+    LanguageProfile,
+)
 from core.models import (
-    AssessmentCard, AssessmentResult, LessonPlan, LessonCard
+    AssessmentCard, AssessmentResult, LessonPlan, LessonCard,
+    TeachingCard, TeachingPlan, SessionStats
 )
 
 # Log application startup
@@ -488,13 +509,14 @@ class AudioPlayer(ttk.Frame):
     Uses pygame for cross-platform audio playback.
     """
     
-    def __init__(self, parent, **kwargs) -> None:
+    def __init__(self, parent, on_skip: Optional[Callable[[], None]] = None, **kwargs) -> None:
         super().__init__(parent, **kwargs)
         
         self._audio_path: Optional[str] = None
         self._is_playing: bool = False
         self._is_loaded: bool = False
         self._playback_finished: bool = False
+        self._on_skip = on_skip
         
         # Create control frame
         self.control_frame = ttk.Frame(self)
@@ -507,7 +529,16 @@ class AudioPlayer(ttk.Frame):
             command=self._on_play_click,
             width=18,
         )
-        self.play_button.pack(padx=5)
+        self.play_button.pack(side="left", padx=5)
+        
+        # Skip button - for users who can't listen to audio
+        self.skip_button = ttk.Button(
+            self.control_frame,
+            text="⏭ Skip Audio",
+            command=self._on_skip_click,
+            width=12,
+        )
+        self.skip_button.pack(side="left", padx=5)
         
         # Status label
         self.status_label = ttk.Label(
@@ -518,6 +549,16 @@ class AudioPlayer(ttk.Frame):
             anchor="center",
         )
         self.status_label.pack(pady=(5, 0))
+        
+        # Skip info label
+        self.skip_info_label = ttk.Label(
+            self,
+            text="Can't listen? Skip this exercise →",
+            font=("Helvetica", 10),
+            foreground="#888888",
+            anchor="center",
+        )
+        self.skip_info_label.pack(pady=(2, 0))
         
         # Loading indicator
         self.loading_label = ttk.Label(
@@ -532,17 +573,26 @@ class AudioPlayer(ttk.Frame):
         # Initially show loading, hide controls
         self._show_loading()
     
+    def _on_skip_click(self) -> None:
+        """Handle skip button click."""
+        logger.ui("User skipped audio exercise")
+        self.stop()
+        if self._on_skip:
+            self._on_skip()
+    
     def _show_loading(self) -> None:
         """Show loading state."""
         self.loading_label.pack(pady=10)
         self.control_frame.pack_forget()
         self.status_label.pack_forget()
+        self.skip_info_label.pack_forget()
     
     def _show_controls(self) -> None:
         """Show playback controls."""
         self.loading_label.pack_forget()
         self.control_frame.pack(pady=10)
         self.status_label.pack(pady=(5, 0))
+        self.skip_info_label.pack(pady=(2, 0))
     
     def set_audio(self, audio_path: str) -> bool:
         """
@@ -656,18 +706,22 @@ class SpeechRecorder(ttk.Frame):
     """
     A widget for recording user speech for speaking exercises.
     Records audio and provides callback with the recorded file path.
+    Uses click-to-start/click-to-stop for better reliability.
     """
     
     SAMPLE_RATE = 16000  # Whisper prefers 16kHz
     CHANNELS = 1  # Mono
     
-    def __init__(self, parent, on_recording_complete: Optional[Callable[[str], None]] = None, **kwargs) -> None:
+    def __init__(self, parent, on_recording_complete: Optional[Callable[[str], None]] = None, 
+                 on_skip: Optional[Callable[[], None]] = None, **kwargs) -> None:
         super().__init__(parent, **kwargs)
         
         self._is_recording: bool = False
         self._recording_data: List = []
         self._recording_path: Optional[str] = None
         self._on_complete = on_recording_complete
+        self._on_skip = on_skip
+        self._record_thread: Optional[threading.Thread] = None
         
         # Prompt label (what to say)
         self.prompt_label = ttk.Label(
@@ -681,27 +735,59 @@ class SpeechRecorder(ttk.Frame):
         )
         self.prompt_label.pack(pady=(10, 15))
         
-        # Record button
-        self.record_button = ttk.Button(
-            self,
-            text="🎤 Hold to Record",
-            width=20,
-        )
-        self.record_button.pack(pady=10)
+        # Button frame to hold record and skip buttons
+        self.button_frame = ttk.Frame(self)
+        self.button_frame.pack(pady=10)
         
-        # Bind press and release for hold-to-record
-        self.record_button.bind("<ButtonPress-1>", self._start_recording)
-        self.record_button.bind("<ButtonRelease-1>", self._stop_recording)
+        # Record button - use tk.Button for better event handling
+        # Using click-to-toggle instead of hold-to-record for reliability
+        self.record_button = tk.Button(
+            self.button_frame,
+            text="🎤 Click to Start Recording",
+            font=("Helvetica", 13, "bold"),
+            bg="#1a1a1a",  # Very dark gray background
+            fg="#e0e0e0",  # Light gray text for contrast
+            activebackground="#5a9bd4",  # Light blue when pressed
+            activeforeground="#000000",  # Black text when pressed
+            highlightbackground="#1a1a1a",
+            highlightcolor="#5a9bd4",
+            relief="raised",
+            borderwidth=3,
+            padx=20,
+            pady=10,
+            cursor="hand2",
+            command=self._toggle_recording,
+        )
+        self.record_button.pack(side="left", padx=5)
+        
+        # Skip button - for users who can't speak/record
+        self.skip_button = ttk.Button(
+            self.button_frame,
+            text="⏭ Skip Speaking",
+            command=self._on_skip_click,
+            width=14,
+        )
+        self.skip_button.pack(side="left", padx=5)
         
         # Status label
         self.status_label = ttk.Label(
             self,
-            text="Press and hold the button to record",
+            text="Click the button to start recording",
             font=("Helvetica", 11),
             foreground="#7bb3ff",
             anchor="center",
         )
-        self.status_label.pack(pady=(5, 10))
+        self.status_label.pack(pady=(5, 5))
+        
+        # Skip info label
+        self.skip_info_label = ttk.Label(
+            self,
+            text="Can't speak right now? Skip this exercise →",
+            font=("Helvetica", 10),
+            foreground="#888888",
+            anchor="center",
+        )
+        self.skip_info_label.pack(pady=(0, 5))
         
         # Transcription result (shown after recording)
         self.transcription_label = ttk.Label(
@@ -719,26 +805,54 @@ class SpeechRecorder(ttk.Frame):
         # Check if recording is available
         if not RECORDING_AVAILABLE:
             self.record_button.configure(state="disabled")
+            error_msg = RECORDING_ERROR or "Recording not available. Install: pip install sounddevice soundfile"
             self.status_label.configure(
-                text="Recording not available. Install: pip install sounddevice soundfile",
+                text=error_msg,
                 foreground="#ff6b6b"
             )
+            # Also hide the skip info since we're showing an error
+            self.skip_info_label.configure(text="Skip this exercise instead →")
+    
+    def _on_skip_click(self) -> None:
+        """Handle skip button click."""
+        logger.ui("User skipped speaking exercise")
+        # Stop any ongoing recording
+        if self._is_recording:
+            self._is_recording = False
+        if self._on_skip:
+            self._on_skip()
+    
+    def _toggle_recording(self) -> None:
+        """Toggle recording on/off with button click."""
+        if self._is_recording:
+            self._stop_recording()
+        else:
+            self._start_recording()
     
     def set_prompt(self, prompt_text: str) -> None:
         """Set the phrase the user should say."""
         self.prompt_label.configure(text=f'"{prompt_text}"')
         self.transcription_label.pack_forget()
-        self.status_label.configure(text="Press and hold the button to record")
+        self.status_label.configure(text="Click the button to start recording", foreground="#7bb3ff")
+        self.record_button.configure(
+            text="🎤 Click to Start Recording",
+            bg="#1a1a1a",  # Very dark gray
+            fg="#e0e0e0",  # Light text
+        )
     
-    def _start_recording(self, event=None) -> None:
+    def _start_recording(self) -> None:
         """Start recording audio."""
         if not RECORDING_AVAILABLE or self._is_recording:
             return
         
+        logger.ui("Starting speech recording...")
         self._is_recording = True
         self._recording_data = []
-        self.record_button.configure(text="🔴 Recording...")
-        self.status_label.configure(text="Recording... Release to stop", foreground="#ff6b6b")
+        self.record_button.configure(
+            text="🔴 Click to Stop Recording",
+            bg="#8B0000",  # Dark red background
+        )
+        self.status_label.configure(text="Recording... Click button when done", foreground="#ff6b6b")
         
         # Start recording in a thread
         def record_audio():
@@ -763,27 +877,35 @@ class SpeechRecorder(ttk.Frame):
             logger.warning(f"Audio status: {status}")
         self._recording_data.append(indata.copy())
     
-    def _stop_recording(self, event=None) -> None:
+    def _stop_recording(self) -> None:
         """Stop recording and save the audio."""
         if not self._is_recording:
             return
         
+        logger.ui("Stopping speech recording...")
         self._is_recording = False
-        self.record_button.configure(text="🎤 Hold to Record")
+        self.record_button.configure(
+            text="🎤 Click to Start Recording",
+            bg="#1a1a1a",  # Very dark gray
+            fg="#e0e0e0",  # Light text
+        )
         self.status_label.configure(text="Processing...", foreground="#7bb3ff")
         
         # Save recording in a thread
         def save_and_callback():
             try:
                 if not self._recording_data:
-                    self.after(0, lambda: self.status_label.configure(
-                        text="No audio recorded. Try again.", foreground="#ff6b6b"
-                    ))
+                    self.after(0, lambda: self._on_no_audio())
                     return
                 
                 import numpy as np
                 # Concatenate all recorded chunks
                 audio_data = np.concatenate(self._recording_data, axis=0)
+                
+                # Check if there's actually audio data
+                if len(audio_data) < self.SAMPLE_RATE * 0.5:  # Less than 0.5 seconds
+                    self.after(0, lambda: self._on_no_audio())
+                    return
                 
                 # Save to temp file
                 fd, path = tempfile.mkstemp(suffix=".wav", prefix="gait_recording_")
@@ -791,10 +913,11 @@ class SpeechRecorder(ttk.Frame):
                 sf.write(path, audio_data, self.SAMPLE_RATE)
                 
                 self._recording_path = path
-                logger.ui(f"Recording saved: {path}")
+                duration = len(audio_data) / self.SAMPLE_RATE
+                logger.ui(f"Recording saved: {path} ({duration:.1f}s)")
                 
                 self.after(0, lambda: self.status_label.configure(
-                    text="Recording complete! Transcribing...", foreground="#7bb3ff"
+                    text=f"Recording complete ({duration:.1f}s)! Transcribing...", foreground="#7bb3ff"
                 ))
                 
                 # Call the completion callback
@@ -808,6 +931,18 @@ class SpeechRecorder(ttk.Frame):
                 ))
         
         threading.Thread(target=save_and_callback, daemon=True).start()
+    
+    def _on_no_audio(self) -> None:
+        """Called when no audio was recorded."""
+        self.status_label.configure(
+            text="No audio recorded. Click the button and speak clearly.", 
+            foreground="#ff6b6b"
+        )
+        self.record_button.configure(
+            text="🎤 Click to Start Recording",
+            bg="#1a1a1a",
+            fg="#e0e0e0",
+        )
     
     def show_transcription(self, text: str) -> None:
         """Show the transcription result."""
@@ -825,10 +960,16 @@ class SpeechRecorder(ttk.Frame):
     
     def reset(self) -> None:
         """Reset the recorder for a new recording."""
+        self._is_recording = False
         self._recording_data = []
         self._recording_path = None
         self.transcription_label.pack_forget()
-        self.status_label.configure(text="Press and hold the button to record", foreground="#7bb3ff")
+        self.status_label.configure(text="Click the button to start recording", foreground="#7bb3ff")
+        self.record_button.configure(
+            text="🎤 Click to Start Recording",
+            bg="#1a1a1a",
+            fg="#e0e0e0",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -891,14 +1032,21 @@ class LanguageBuddyApp(tk.Tk):
         self.assessment_stage: int = 0  # 0-3 (0 = not started, 1-3 = current stage)
         self.assessment_responses: List[Dict[str, Any]] = []
         self.assessment_result: Optional[AssessmentResult] = None
-        self.lesson_plan: Optional[LessonPlan] = None
+        self.teaching_plan: Optional[TeachingPlan] = None  # Teaching content before quiz
+        self.lesson_plan: Optional[LessonPlan] = None  # Quiz cards
         self.lesson_index: int = 0
         self.final_summary: Optional[Dict[str, Any]] = None
         self.pending_assessment_images: Set[str] = set()
+        self.session_stats: Optional[SessionStats] = None  # For tracking changes
         
         # Image cache
         self.image_cache: Dict[str, str] = {}  # image_prompt -> image_path
         self.image_photos: Dict[str, ImageTk.PhotoImage] = {}  # image_path -> PhotoImage
+        
+        # Database and session tracking
+        self._init_database()
+        self.current_session: Optional[SessionRecord] = None
+        self.session_vocabulary: List[str] = []  # Words encountered this session
 
         # Container for "cards"
         container = ttk.Frame(self)
@@ -912,7 +1060,7 @@ class LanguageBuddyApp(tk.Tk):
         self.cards = {}
 
         logger.ui("Creating card views...")
-        for CardClass in (IntroCard, AssessmentCardView, LessonCardView, SummaryCard):
+        for CardClass in (IntroCard, AssessmentCardView, AssessmentResultsCard, TeachingCardView, LessonCardView, SummaryCard):
             card = CardClass(parent=container, controller=self)
             self.cards[CardClass.__name__] = card
             card.grid(row=0, column=0, sticky="nsew")
@@ -920,6 +1068,170 @@ class LanguageBuddyApp(tk.Tk):
 
         logger.ui("Application initialized successfully")
         self.show_card("IntroCard")
+    
+    def _init_database(self) -> None:
+        """Initialize database connection."""
+        logger.task_start("database_initialization")
+        self.database_connected = False
+        self.database_error: Optional[str] = None
+        
+        success = initialize_database()
+        if success:
+            logger.task_complete("database_initialization")
+            # Load or create default user
+            db = get_db()
+            user = db.get_or_create_user()
+            if user:
+                logger.success(f"Database user loaded: {user.user_id}")
+                self.database_connected = True
+            else:
+                logger.warning("Database connected but failed to load user")
+                self.database_error = "Connected but failed to load user profile"
+        else:
+            logger.warning("Database not connected. Progress will not be saved.")
+            # Check for specific error reasons
+            import os
+            creds_path = os.getenv("FIREBASE_CREDENTIALS_PATH")
+            if not creds_path:
+                self.database_error = "FIREBASE_CREDENTIALS_PATH not set in .env"
+            elif not os.path.exists(creds_path):
+                self.database_error = f"Credentials file not found: {creds_path}"
+            else:
+                self.database_error = "Failed to connect to Firebase"
+    
+    def _track_vocabulary_from_card(self, card: LessonCard, evaluation: Dict[str, Any]) -> None:
+        """Track vocabulary encountered in a lesson card."""
+        db = get_db()
+        language = self.selected_language or "Spanish"
+        
+        # Get words to track from card
+        words_to_track = []
+        
+        # Main word from the card (for vocabulary cards)
+        if card.word:
+            words_to_track.append({
+                "word": card.word,
+                "translation": card.translation or "",
+                "example": card.example or "",
+            })
+        
+        # Correct answer might be a vocabulary word
+        if card.correct_answer and card.type in ("image_question", "fill_in_blank"):
+            words_to_track.append({
+                "word": card.correct_answer,
+                "translation": "",  # We don't always have translation
+                "example": card.question or "",
+            })
+        
+        # Vocabulary expansion words
+        for word in (evaluation.get("vocabulary_expansion") or card.vocabulary_expansion or []):
+            if word:
+                words_to_track.append({
+                    "word": word,
+                    "translation": "",
+                    "example": "",
+                })
+        
+        # Track each word
+        for word_data in words_to_track:
+            word = word_data["word"]
+            if not word or len(word) < 2:
+                continue
+            
+            # Track in session
+            if word not in self.session_vocabulary:
+                self.session_vocabulary.append(word)
+            
+            # Get or create vocabulary item
+            vocab_item = db.get_vocabulary_item(word, language)
+            if not vocab_item:
+                vocab_item = VocabularyItem(
+                    word=word,
+                    translation=word_data.get("translation", ""),
+                    language=language,
+                )
+                if self.current_session:
+                    self.current_session.new_vocabulary.append(word)
+            
+            # Record encounter
+            vocab_item.record_encounter(
+                correct=card.is_correct or False,
+                card_type=card.type,
+                example=word_data.get("example", ""),
+            )
+            
+            # Save to database
+            db.save_vocabulary_item(vocab_item)
+        
+        logger.debug(f"Tracked {len(words_to_track)} vocabulary words from card")
+    
+    def _save_session_to_database(self) -> None:
+        """Save session record and update language profile."""
+        if not self.current_session:
+            return
+        
+        from datetime import datetime, timezone
+        
+        db = get_db()
+        language = self.selected_language or "Spanish"
+        
+        # Finalize session record
+        self.current_session.ended_at = datetime.now(timezone.utc).isoformat()
+        
+        # Calculate session stats
+        if self.lesson_plan:
+            self.current_session.cards_completed = len(self.lesson_plan.cards)
+            self.current_session.cards_correct = sum(
+                1 for card in self.lesson_plan.cards if card.is_correct
+            )
+            self.current_session.total_score = self.lesson_plan.total_score
+        
+        self.current_session.vocabulary_practiced = self.session_vocabulary
+        
+        # Calculate duration
+        try:
+            start = datetime.fromisoformat(self.current_session.started_at.replace('Z', '+00:00'))
+            end = datetime.fromisoformat(self.current_session.ended_at.replace('Z', '+00:00'))
+            self.current_session.duration_minutes = int((end - start).total_seconds() / 60)
+        except Exception:
+            pass
+        
+        # Set proficiency at end
+        if self.assessment_result:
+            self.current_session.proficiency_at_end = self.assessment_result.proficiency
+        
+        # Save session
+        db.save_session(self.current_session)
+        logger.success(f"Session saved: {self.current_session.session_id}")
+        
+        # Update language profile
+        lang_profile = db.get_language_profile(language)
+        if self.assessment_result:
+            lang_profile.overall_proficiency = self.assessment_result.proficiency
+            lang_profile.vocabulary_level = self.assessment_result.vocabulary_level
+            lang_profile.grammar_level = self.assessment_result.grammar_level
+            lang_profile.fluency_score = self.assessment_result.fluency_score
+            lang_profile.strengths = self.assessment_result.strengths
+            lang_profile.weaknesses = self.assessment_result.weaknesses
+            lang_profile.recommendations = self.assessment_result.recommendations
+            lang_profile.last_assessment_date = datetime.now(timezone.utc).isoformat()
+        
+        lang_profile.total_sessions += 1
+        lang_profile.total_cards_completed += self.current_session.cards_completed
+        lang_profile.total_vocabulary_learned = len(db.get_all_vocabulary(language))
+        lang_profile.total_time_minutes += self.current_session.duration_minutes
+        
+        # Update streak
+        lang_profile.last_practice_date = datetime.now(timezone.utc).isoformat()
+        # Simple streak logic - would need more sophistication for real tracking
+        lang_profile.current_streak_days = min(lang_profile.current_streak_days + 1, 365)
+        lang_profile.longest_streak_days = max(
+            lang_profile.longest_streak_days, 
+            lang_profile.current_streak_days
+        )
+        
+        db.update_language_profile(lang_profile)
+        logger.success(f"Language profile updated: {lang_profile.overall_proficiency}")
 
     # Card management -------------------------------------------------------
 
@@ -943,31 +1255,242 @@ class LanguageBuddyApp(tk.Tk):
         self.lesson_plan = None
         self.lesson_index = 0
         self.final_summary = None
+        self.session_vocabulary = []
+        
+        # Create session record
+        import uuid
+        from datetime import datetime, timezone
+        session_id = str(uuid.uuid4())[:8]
+        self.current_session = SessionRecord(
+            session_id=session_id,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            language=language,
+            session_type="lesson",
+        )
+        
+        # Check for existing language profile
+        db = get_db()
+        lang_profile = db.get_language_profile(language)
+        
+        if lang_profile and lang_profile.total_sessions > 0:
+            # Returning learner - skip assessment and go directly to lessons
+            self.current_session.proficiency_at_start = lang_profile.overall_proficiency
+            logger.ui(f"Returning learner: {lang_profile.overall_proficiency} level, {lang_profile.total_sessions} sessions")
+            logger.ui("Skipping assessment, generating lessons based on existing profile...")
+            
+            # Create assessment result from existing profile
+            self.assessment_result = AssessmentResult(
+                proficiency=lang_profile.overall_proficiency,
+                vocabulary_level=lang_profile.vocabulary_level,
+                grammar_level=lang_profile.grammar_level,
+                fluency_score=lang_profile.fluency_score,
+                strengths=lang_profile.strengths,
+                weaknesses=lang_profile.weaknesses,
+                recommendations=lang_profile.recommendations,
+            )
+            
+            # Go directly to lesson generation
+            self._generate_lessons_for_returning_learner()
+        else:
+            # New learner - run full assessment
+            logger.ui("New learner - starting comprehensive assessment...")
+            self.current_session.session_type = "assessment"
+            
+            # Show loading spinner and switch to assessment card
+            assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
+            assessment_card.show_loading("Generating assessment questions (10-12 questions)...")
+            self.show_card("AssessmentCardView")
 
-        # Show loading spinner and switch to assessment card
-        assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
-        assessment_card.show_loading("Generating assessment questions...")
-        self.show_card("AssessmentCardView")
+            # Run API calls in a background thread
+            def generate_assessment_threaded():
+                logger.task_start("generate_assessment_threaded")
+                try:
+                    # Generate all assessment cards (comprehensive 10-12 question assessment)
+                    assessment_cards = generate_assessment_cards(language)
+                    logger.task_complete("generate_assessment_threaded")
 
-        # Run API calls in a background thread
-        def generate_assessment_threaded():
-            logger.task_start("generate_assessment_threaded")
+                    # Show questions ASAP; images are fetched per-card on demand
+                    self.after(0, lambda: self._on_assessment_generated(assessment_cards))
+
+                except Exception as e:
+                    logger.task_error("generate_assessment_threaded", str(e))
+                    # Show error in main thread
+                    self.after(0, lambda: self._on_assessment_error(str(e)))
+
+            thread = threading.Thread(target=generate_assessment_threaded, daemon=True)
+            thread.start()
+            logger.task("Spawned background thread for assessment generation")
+    
+    def _generate_lessons_for_returning_learner(self) -> None:
+        """Generate teaching and quiz content for a returning learner (skip assessment)."""
+        # Show loading on teaching card
+        teaching_card: TeachingCardView = self.cards["TeachingCardView"]
+        teaching_card.show_loading(f"Preparing lessons for {self.assessment_result.proficiency} level...")
+        self.show_card("TeachingCardView")
+        
+        # Store learner context for later use
+        self._learner_context = None
+        
+        # Track batches for progressive loading
+        self._teaching_batches: List[TeachingCard] = []
+        self._first_batch_shown = False
+        
+        def on_batch_ready(cards: List[TeachingCard], batch_num: int, total_batches: int) -> None:
+            """Called when each batch of teaching cards is ready."""
+            self._teaching_batches.extend(cards)
+            
+            # Update loading message with progress
+            progress_msg = f"Generating lessons... ({batch_num}/{total_batches} batches)"
+            self.after(0, lambda: teaching_card.update_loading_progress(
+                progress_msg, batch_num, total_batches, len(self._teaching_batches)
+            ))
+            
+            # Show first batch immediately (don't wait for all batches)
+            if batch_num == 1 and not self._first_batch_shown:
+                self._first_batch_shown = True
+                # Create partial teaching plan with first batch
+                self.teaching_plan = TeachingPlan(
+                    cards=list(self._teaching_batches),
+                    proficiency_target=self.assessment_result.proficiency,
+                    theme="Loading...",
+                    new_words_count=sum(1 for c in self._teaching_batches if c.is_new),
+                    review_words_count=sum(1 for c in self._teaching_batches if c.is_review),
+                )
+                self.after(0, self._on_first_teaching_batch_ready)
+            else:
+                # Update existing teaching plan with new cards
+                self.after(0, lambda: self._on_teaching_batch_added(cards))
+        
+        def generate_teaching_content_threaded():
+            """Generate teaching content in batches for progressive loading."""
+            logger.task_start("generate_teaching_content")
             try:
-                # Generate all assessment cards (fast text-only call)
-                assessment_cards = generate_assessment_cards(language)
-                logger.task_complete("generate_assessment_threaded")
-
-                # Show questions ASAP; images are fetched per-card on demand
-                self.after(0, lambda: self._on_assessment_generated(assessment_cards))
-
+                # Get learner context from database
+                db = get_db()
+                if db.is_connected():
+                    self._learner_context = db.generate_llm_context_string(
+                        self.selected_language or "Spanish"
+                    )
+                    logger.debug(f"Loaded learner context: {len(self._learner_context)} chars")
+                
+                # Generate teaching content in batches with callback
+                logger.ui("Generating teaching content in batches...")
+                teaching_plan = generate_teaching_content(
+                    language=self.selected_language or "Spanish",
+                    proficiency=self.assessment_result.proficiency,
+                    learner_context=self._learner_context,
+                    num_new_words=12,
+                    num_review_words=5,
+                    on_batch_ready=on_batch_ready,  # Progressive loading callback
+                )
+                
+                self.teaching_plan = teaching_plan
+                logger.task_complete("generate_teaching_content")
+                logger.ui(f"Teaching content ready: {len(teaching_plan.cards)} cards")
+                
+                # Finalize teaching cards display
+                self.after(0, self._on_teaching_content_ready)
+                
+                # Start quiz generation in background
+                self.after(0, self._start_quiz_generation_background)
+                
             except Exception as e:
-                logger.task_error("generate_assessment_threaded", str(e))
-                # Show error in main thread
-                self.after(0, lambda: self._on_assessment_error(str(e)))
-
-        thread = threading.Thread(target=generate_assessment_threaded, daemon=True)
+                logger.task_error("generate_teaching_content", str(e))
+                self.after(0, lambda: teaching_card.show_loading(f"Error: {str(e)}"))
+        
+        thread = threading.Thread(target=generate_teaching_content_threaded, daemon=True)
         thread.start()
-        logger.task("Spawned background thread for assessment generation")
+        logger.task("Spawned background thread for teaching content generation")
+    
+    def _on_first_teaching_batch_ready(self) -> None:
+        """Called when the first batch of teaching cards is ready - show immediately."""
+        if not self.teaching_plan or not self.teaching_plan.cards:
+            logger.error("No teaching cards in first batch")
+            return
+        
+        logger.ui(f"First batch ready: {len(self.teaching_plan.cards)} cards - showing immediately!")
+        self._capture_initial_stats()
+        
+        # Show teaching cards immediately (more batches may still be loading)
+        teaching_card: TeachingCardView = self.cards["TeachingCardView"]
+        teaching_card.set_teaching_plan(self.teaching_plan, more_loading=True)
+    
+    def _on_teaching_batch_added(self, new_cards: List[TeachingCard]) -> None:
+        """Called when additional teaching cards are added from a new batch."""
+        if not self.teaching_plan:
+            return
+        
+        # Update existing plan with new cards
+        self.teaching_plan.cards.extend(new_cards)
+        self.teaching_plan.new_words_count = sum(1 for c in self.teaching_plan.cards if c.is_new)
+        self.teaching_plan.review_words_count = sum(1 for c in self.teaching_plan.cards if c.is_review)
+        
+        logger.ui(f"Added {len(new_cards)} cards - total now: {len(self.teaching_plan.cards)}")
+        
+        # Update UI
+        teaching_card: TeachingCardView = self.cards["TeachingCardView"]
+        teaching_card.update_card_count(len(self.teaching_plan.cards))
+        
+        # Start generating images/audio for new cards
+        teaching_card.add_cards_to_generation(new_cards)
+    
+    def _on_teaching_content_ready(self) -> None:
+        """Called when all teaching content is ready."""
+        if not self.teaching_plan:
+            logger.error("Teaching plan not available")
+            return
+        
+        logger.ui(f"All teaching content ready: {len(self.teaching_plan.cards)} cards, theme: {self.teaching_plan.theme}")
+        
+        # Mark loading as complete with final theme
+        teaching_card: TeachingCardView = self.cards["TeachingCardView"]
+        teaching_card.mark_batches_complete(final_theme=self.teaching_plan.theme)
+    
+    def _start_quiz_generation_background(self) -> None:
+        """Start generating quiz content in background thread."""
+        if not self.teaching_plan:
+            logger.error("Cannot generate quiz without teaching plan")
+            return
+        
+        def generate_quiz_threaded():
+            logger.task_start("generate_quiz_content")
+            try:
+                logger.ui("Generating quiz cards based on teaching content...")
+                lesson_plan = generate_structured_lesson_plan(
+                    self.assessment_result,
+                    self.selected_language or "Spanish",
+                    learner_context=self._learner_context,
+                    teaching_plan=self.teaching_plan  # Quiz tests what was taught!
+                )
+                
+                self.lesson_plan = lesson_plan
+                logger.task_complete("generate_quiz_content")
+                logger.ui(f"Quiz ready: {len(lesson_plan.cards)} cards")
+                
+                # Start image generation for quiz cards
+                quiz_image_prompts = [
+                    card.image_prompt for card in lesson_plan.cards 
+                    if card.image_prompt and card.image_prompt not in self.image_cache
+                ]
+                if quiz_image_prompts:
+                    logger.ui(f"Starting background generation of {len(quiz_image_prompts)} quiz images...")
+                    generate_images_parallel(
+                        list(set(quiz_image_prompts)),
+                        lambda prompt, path: self._on_any_image_generated(prompt, path)
+                    )
+                
+            except Exception as e:
+                logger.task_error("generate_quiz_content", str(e))
+                logger.error(f"Quiz generation failed: {e}")
+        
+        thread = threading.Thread(target=generate_quiz_threaded, daemon=True)
+        thread.start()
+        logger.task("Spawned background thread for quiz generation")
+    
+    
+    def _on_returning_learner_content_ready(self) -> None:
+        """Legacy: Called when content is ready. Now handled by _on_teaching_content_ready."""
+        self._on_teaching_content_ready()
 
 
     def _on_assessment_image_generated(self, image_prompt: str, image_path: Optional[str]) -> None:
@@ -998,10 +1521,48 @@ class LanguageBuddyApp(tk.Tk):
         self.assessment_cards = assessment_cards
         self.assessment_stage = 1
         
+        # Start generating ALL assessment images in parallel
+        self._start_parallel_assessment_image_generation()
+        
         assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
+        assessment_card.total_stages = len(assessment_cards)  # Set total for progress display
         assessment_card.hide_loading()
-        logger.ui("Showing assessment stage 1")
+        logger.ui(f"Showing assessment question 1 of {len(assessment_cards)}")
         assessment_card.show_stage(1, assessment_cards[0])
+    
+    def _start_parallel_assessment_image_generation(self) -> None:
+        """Start generating all assessment images in parallel background threads."""
+        if not self.assessment_cards:
+            return
+        
+        # Collect all image prompts that need generation
+        # AssessmentCard wraps a LessonCard in its .card attribute
+        image_prompts_to_generate = []
+        for i, assessment_card in enumerate(self.assessment_cards):
+            image_prompt = assessment_card.card.image_prompt
+            if image_prompt and image_prompt not in self.image_cache:
+                if image_prompt not in self.pending_assessment_images:
+                    image_prompts_to_generate.append(image_prompt)  # Just the prompt string
+                    self.pending_assessment_images.add(image_prompt)
+        
+        if not image_prompts_to_generate:
+            logger.debug("No assessment images to generate (all cached or none needed)")
+            return
+        
+        logger.ui(f"Starting parallel generation of {len(image_prompts_to_generate)} assessment images...")
+        
+        # Use the parallel image generation function (expects List[str])
+        generate_images_parallel(
+            image_prompts_to_generate,
+            lambda prompt, path: self._on_assessment_image_parallel_done(prompt, path)
+        )
+    
+    def _on_assessment_image_parallel_done(self, image_prompt: str, image_path: Optional[str]) -> None:
+        """Callback when a parallel assessment image generation completes."""
+        def update_ui():
+            self.pending_assessment_images.discard(image_prompt)
+            self._on_assessment_image_generated(image_prompt, image_path)
+        self.after(0, update_ui)
 
     def _on_assessment_error(self, error: str) -> None:
         """Called when assessment generation fails (in main thread)."""
@@ -1036,17 +1597,18 @@ class LanguageBuddyApp(tk.Tk):
 
     def submit_assessment_response(self, stage: int, response: str, answer_index: Optional[int] = None) -> None:
         """Called by AssessmentCardView when user submits an assessment response."""
-        logger.ui(f"Assessment response submitted for stage {stage}")
+        logger.ui(f"Assessment response submitted for question {stage} of {len(self.assessment_cards)}")
         
-        if stage < 1 or stage > 3 or stage > len(self.assessment_cards):
+        total_stages = len(self.assessment_cards)
+        if stage < 1 or stage > total_stages:
             logger.warning(f"Invalid stage number: {stage}")
             return
         
         # Store response (serialize card to dict, not LessonCard object)
         card = self.assessment_cards[stage - 1].card
-        self.assessment_responses.append({
+        response_data = {
             "stage": stage,
-            "response": response,
+            "response": response,  # THE USER'S ACTUAL ANSWER
             "answer_index": answer_index,
             "card_type": card.type,
             "question": card.question or card.word or "",
@@ -1055,59 +1617,122 @@ class LanguageBuddyApp(tk.Tk):
             "correct_answer": card.correct_answer,
             "options": card.options,
             "correct_index": card.correct_index,
-        })
-        logger.debug(f"Stored response for stage {stage}, total responses: {len(self.assessment_responses)}")
+        }
+        self.assessment_responses.append(response_data)
+        
+        # Log what we're storing
+        logger.debug(f"Stored assessment response for question {stage}:")
+        logger.debug(f"  Question: {response_data['question'][:60] if response_data['question'] else 'N/A'}...")
+        logger.debug(f"  User's answer: '{response}'")
+        logger.debug(f"  Correct answer: {response_data['correct_answer'][:60] if response_data['correct_answer'] else 'N/A'}...")
+        logger.debug(f"  Total responses collected: {len(self.assessment_responses)}")
         
         # Move to next stage or evaluate
-        if stage < 3:
+        if stage < total_stages:
             self.assessment_stage = stage + 1
             logger.ui(f"Moving to assessment stage {stage + 1}")
             assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
             assessment_card.show_stage(stage + 1, self.assessment_cards[stage])
         else:
-            # All assessments done - evaluate and generate lesson plan
-            logger.ui("All assessments complete, generating lesson plan...")
+            # All assessments done - evaluate responses first, then generate content
+            logger.ui("All assessments complete, evaluating responses...")
             assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
-            assessment_card.show_loading("Evaluating your responses and generating personalized lessons...")
+            assessment_card.show_loading("Evaluating your responses...")
             
-            def evaluate_and_generate_lesson():
-                logger.task_start("evaluate_and_generate_lesson")
+            # Store learner context for later use
+            self._learner_context = None
+            
+            def evaluate_assessment_threaded():
+                """Step 1: Evaluate assessment (fast), show results immediately."""
+                logger.task_start("evaluate_assessment")
                 try:
-                    # OPTIMIZED: Combine assessment evaluation + lesson generation into ONE API call
-                    logger.ui("Starting lesson generation...")
-                    assessment_result, lesson_plan = generate_lesson_plan_from_assessment_responses(
-                        self.assessment_responses,
-                        self.selected_language or "Spanish"
-                    )
-                    logger.task_complete("evaluate_and_generate_lesson")
-                    logger.ui("Lesson plan generated, switching to lesson view...")
-                    
-                    # Show first lesson immediately - don't wait for images
-                    self.after(0, lambda: self._on_lesson_plan_generated(assessment_result, lesson_plan))
-                    
-                    # Start ALL image generation in background (don't block UI)
-                    image_prompts_to_generate = [
-                        card.image_prompt 
-                        for card in lesson_plan.cards 
-                        if card.image_prompt and card.image_prompt not in self.image_cache
-                    ]
-                    
-                    # Generate all images in parallel using optimized function
-                    if image_prompts_to_generate:
-                        logger.ui(f"Starting background generation of {len(image_prompts_to_generate)} lesson images...")
-                        generate_images_parallel(
-                            image_prompts_to_generate,
-                            lambda prompt, path: self._on_lesson_image_generated(prompt, path)
+                    # Get learner context from database
+                    db = get_db()
+                    if db.is_connected():
+                        self._learner_context = db.generate_llm_context_string(
+                            self.selected_language or "Spanish"
                         )
-                    else:
-                        logger.debug("No images to generate (all cached or no image prompts)")
+                        logger.debug(f"Loaded learner context: {len(self._learner_context)} chars")
+                    
+                    # Evaluate assessment responses (one API call)
+                    logger.ui("Evaluating assessment responses...")
+                    assessment_result = evaluate_assessment_responses(
+                        self.selected_language or "Spanish",
+                        self.assessment_responses
+                    )
+                    
+                    self.assessment_result = assessment_result
+                    logger.task_complete("evaluate_assessment")
+                    logger.ui(f"Assessment evaluated: {assessment_result.proficiency} level")
+                    
+                    # Show assessment results immediately
+                    self.after(0, self._on_assessment_evaluated)
+                    
+                    # Start teaching content generation in background
+                    self.after(0, lambda: self._start_teaching_generation_background(assessment_result))
+                    
                 except Exception as e:
-                    logger.task_error("evaluate_and_generate_lesson", str(e))
+                    logger.task_error("evaluate_assessment", str(e))
                     self.after(0, lambda: self._on_lesson_generation_error(str(e)))
             
-            thread = threading.Thread(target=evaluate_and_generate_lesson, daemon=True)
+            thread = threading.Thread(target=evaluate_assessment_threaded, daemon=True)
             thread.start()
-            logger.task("Spawned background thread for lesson generation")
+            logger.task("Spawned background thread for assessment evaluation")
+    
+    def _on_assessment_evaluated(self) -> None:
+        """Called when assessment is evaluated - show results immediately."""
+        if not self.assessment_result:
+            logger.error("Assessment result not available")
+            return
+        
+        logger.ui(f"Showing assessment results: {self.assessment_result.proficiency}")
+        
+        # Capture initial stats
+        self._capture_initial_stats()
+        
+        # Show assessment results card
+        results_card: AssessmentResultsCard = self.cards["AssessmentResultsCard"]
+        results_card.show_results(self.assessment_result, self.selected_language or "Spanish")
+        self.show_card("AssessmentResultsCard")
+    
+    def _start_teaching_generation_background(self, assessment_result: AssessmentResult) -> None:
+        """Start generating teaching content in background thread with batched loading."""
+        # Track batches for progressive loading
+        self._teaching_batches = []
+        self._first_batch_shown = False
+        
+        def on_batch_ready(cards: List[TeachingCard], batch_num: int, total_batches: int) -> None:
+            """Called when each batch of teaching cards is ready."""
+            self._teaching_batches.extend(cards)
+            logger.ui(f"New learner batch {batch_num}/{total_batches}: {len(cards)} cards")
+        
+        def generate_teaching_threaded():
+            logger.task_start("generate_teaching_for_new_learner")
+            try:
+                logger.ui("Generating teaching content in batches...")
+                teaching_plan = generate_teaching_content(
+                    language=self.selected_language or "Spanish",
+                    proficiency=assessment_result.proficiency,
+                    learner_context=self._learner_context,
+                    num_new_words=12,
+                    num_review_words=5,
+                    on_batch_ready=on_batch_ready,  # Progressive loading
+                )
+                
+                self.teaching_plan = teaching_plan
+                logger.task_complete("generate_teaching_for_new_learner")
+                logger.ui(f"Teaching content ready: {len(teaching_plan.cards)} cards")
+                
+                # Start quiz generation based on teaching content
+                self.after(0, lambda: self._start_quiz_generation_background())
+                
+            except Exception as e:
+                logger.task_error("generate_teaching_for_new_learner", str(e))
+                logger.error(f"Teaching generation failed: {e}")
+        
+        thread = threading.Thread(target=generate_teaching_threaded, daemon=True)
+        thread.start()
+        logger.task("Spawned background thread for teaching content generation")
 
     def _on_lesson_image_generated(self, image_prompt: str, image_path: Optional[str]) -> None:
         """Called when a lesson image is generated (in main thread)."""
@@ -1117,28 +1742,110 @@ class LanguageBuddyApp(tk.Tk):
             # Update UI if this card is currently displayed
             lesson_card: LessonCardView = self.cards["LessonCardView"]
             lesson_card.update_image_if_needed(image_prompt, image_path)
+    
+    def _on_any_image_generated(self, image_prompt: str, image_path: Optional[str]) -> None:
+        """Called when any image (teaching or quiz) is generated."""
+        if not image_path:
+            return
+        
+        def update_ui():
+            logger.debug(f"Image ready: {image_prompt[:50]}...")
+            self.image_cache[image_prompt] = image_path
+            
+            # Update teaching cards if any use this image
+            if self.teaching_plan:
+                for card in self.teaching_plan.cards:
+                    if card.image_prompt == image_prompt:
+                        card.image_path = image_path
+            
+            # Update lesson cards if any use this image
+            if self.lesson_plan:
+                for card in self.lesson_plan.cards:
+                    if card.image_prompt == image_prompt:
+                        card.image_path = image_path
+            
+            # Notify currently visible view to update
+            lesson_card: LessonCardView = self.cards["LessonCardView"]
+            lesson_card.update_image_if_needed(image_prompt, image_path)
+        
+        self.after(0, update_ui)
 
-    def _on_lesson_plan_generated(self, assessment_result: AssessmentResult, lesson_plan: LessonPlan) -> None:
-        """Called when lesson plan generation completes (in main thread)."""
-        logger.ui("Lesson plan received, switching to lesson view...")
-        logger.debug(f"Assessment: proficiency={assessment_result.proficiency}, "
-                    f"fluency_score={assessment_result.fluency_score}")
-        logger.debug(f"Lesson plan: {len(lesson_plan.cards)} cards, target={lesson_plan.proficiency_target}")
+    def _capture_initial_stats(self) -> None:
+        """Capture initial stats for comparing before/after in summary."""
+        db = get_db()
+        language = self.selected_language or "Spanish"
         
-        self.assessment_result = assessment_result
-        self.lesson_plan = lesson_plan
-        self.lesson_index = 0
+        profile = db.get_language_profile(language) if db.is_connected() else None
         
-        # Hide assessment loading
-        assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
-        assessment_card.hide_loading()
+        self.session_stats = SessionStats(
+            words_learned_before=profile.total_vocabulary_learned if profile else 0,
+            fluency_before=profile.fluency_score if profile else 0,
+            proficiency_before=profile.overall_proficiency if profile else "A1",
+            streak_before=profile.current_streak_days if profile else 0,
+        )
+        logger.debug(f"Initial stats captured: {self.session_stats.words_learned_before} words, "
+                    f"fluency={self.session_stats.fluency_before}")
+    
+    def proceed_to_lessons(self) -> None:
+        """Called from AssessmentResultsCard to proceed to teaching phase."""
+        logger.ui("Proceeding to learning phase...")
         
-        # Switch to lesson card view and show first card
+        # Show teaching card view
+        teaching_card: TeachingCardView = self.cards["TeachingCardView"]
+        self.show_card("TeachingCardView")
+        
+        # Check if we have teaching content
+        if self.teaching_plan and len(self.teaching_plan.cards) > 0:
+            # Show teaching content
+            logger.ui(f"Showing teaching content: {len(self.teaching_plan.cards)} cards")
+            teaching_card.set_teaching_plan(self.teaching_plan)
+        else:
+            # Teaching content still generating - show loading
+            logger.ui("Teaching content still generating, showing loading...")
+            teaching_card.show_loading("Preparing your personalized lessons...")
+            # Check periodically if content is ready
+            self._wait_for_teaching_content()
+    
+    def _wait_for_teaching_content(self) -> None:
+        """Poll for teaching content to be ready."""
+        if self.teaching_plan and len(self.teaching_plan.cards) > 0:
+            logger.ui("Teaching content now ready!")
+            teaching_card: TeachingCardView = self.cards["TeachingCardView"]
+            teaching_card.set_teaching_plan(self.teaching_plan)
+        else:
+            # Check again in 500ms
+            self.after(500, self._wait_for_teaching_content)
+    
+    def proceed_to_quiz(self) -> None:
+        """Called from TeachingCardView or directly to proceed to quiz cards."""
+        logger.ui("Proceeding to quiz...")
+        
+        # Switch to lesson card view
         lesson_card: LessonCardView = self.cards["LessonCardView"]
-        logger.ui("Showing first lesson card...")
         self.show_card("LessonCardView")
-        lesson_card.hide_loading()
-        lesson_card.show_card_index(0)
+        
+        if self.lesson_plan and len(self.lesson_plan.cards) > 0:
+            # Quiz ready - show first card
+            logger.ui(f"Showing quiz: {len(self.lesson_plan.cards)} cards")
+            lesson_card.hide_loading()
+            lesson_card.show_card_index(0)
+        else:
+            # Quiz still generating - show loading
+            logger.ui("Quiz content still generating, showing loading...")
+            lesson_card.show_loading("Preparing your quiz...")
+            # Check periodically if content is ready
+            self._wait_for_quiz_content()
+    
+    def _wait_for_quiz_content(self) -> None:
+        """Poll for quiz content to be ready."""
+        if self.lesson_plan and len(self.lesson_plan.cards) > 0:
+            logger.ui("Quiz content now ready!")
+            lesson_card: LessonCardView = self.cards["LessonCardView"]
+            lesson_card.hide_loading()
+            lesson_card.show_card_index(0)
+        else:
+            # Check again in 500ms
+            self.after(500, self._wait_for_quiz_content)
 
     def _on_lesson_generation_error(self, error: str) -> None:
         """Called when lesson generation fails (in main thread)."""
@@ -1191,6 +1898,9 @@ class LanguageBuddyApp(tk.Tk):
                     card.alternatives = evaluation["alternatives"]
                 if evaluation.get("vocabulary_expansion"):
                     card.vocabulary_expansion = evaluation["vocabulary_expansion"]
+                
+                # Track vocabulary in database
+                self._track_vocabulary_from_card(card, evaluation)
                 
                 logger.task_complete(f"evaluate_response_card_{self.lesson_index + 1}")
                 logger.debug(f"Evaluation: correct={card.is_correct}, score={card.card_score}")
@@ -1254,6 +1964,10 @@ class LanguageBuddyApp(tk.Tk):
                         self.selected_language or "Spanish"
                     )
                     self.final_summary = summary
+                    
+                    # Save session to database
+                    self._save_session_to_database()
+                    
                     logger.task_complete("generate_summary")
                     self.after(0, lambda: summary_card.set_summary(summary, self.lesson_plan))
                 except Exception as e:
@@ -1277,9 +1991,11 @@ class LanguageBuddyApp(tk.Tk):
         self.assessment_stage = 0
         self.assessment_responses = []
         self.assessment_result = None
+        self.teaching_plan = None
         self.lesson_plan = None
         self.lesson_index = 0
         self.final_summary = None
+        self.session_stats = None
         self.image_cache.clear()
         self.image_photos.clear()
         
@@ -1321,13 +2037,18 @@ class IntroCard(ttk.Frame):
         title.grid(row=0, column=0, pady=(40, 20), padx=20)
 
         desc_text = (
-            "Welcome! This tool helps you learn and practice another language with personalized lessons.\n\n"
-            "You will:\n"
-            "  1. Choose a target language.\n"
-            "  2. Complete a 3-stage assessment to determine your proficiency level.\n"
-            "  3. Work through 10 personalized lesson cards with various question types.\n"
-            "  4. Receive immediate feedback on each answer with vocabulary expansion.\n\n"
-            "At the end, you'll see a comprehensive summary with scores and study suggestions."
+            "Welcome! This AI-powered tool helps you learn languages with personalized lessons.\n\n"
+            "How it works:\n"
+            "  1. Choose a language — you can learn multiple simultaneously!\n"
+            "  2. New learners take a comprehensive assessment (10-12 questions)\n"
+            "     to determine your starting proficiency level.\n"
+            "  3. 📚 Learning Phase — Study new vocabulary, grammar, and phrases\n"
+            "     with images, audio pronunciation, and conjugation tables.\n"
+            "  4. 📝 Quiz Phase — Test what you learned with multiple choice,\n"
+            "     fill-in-the-blank, listening, and speaking exercises.\n"
+            "  5. 📊 Get feedback and track your progress over time.\n\n"
+            "Returning learners skip the assessment and jump straight into learning!\n"
+            "Your vocabulary, progress, and streaks are saved automatically."
         )
         desc = ttk.Label(
             self.content, 
@@ -1338,13 +2059,14 @@ class IntroCard(ttk.Frame):
             font=("Helvetica", 14),
             foreground="#d0d0d0",  # Light gray text on dark background
         )
-        desc.grid(row=1, column=0, padx=40, pady=(0, 30))
+        desc.grid(row=1, column=0, padx=40, pady=(0, 20))
         self.desc_label = desc
-
+        
+        # Language selection for new/continue
         lang_frame = ttk.Frame(self.content)
         lang_frame.grid(row=2, column=0, padx=40, pady=(0, 20))
 
-        ttk.Label(lang_frame, text="Choose your target language:", font=("Helvetica", 14)).grid(
+        ttk.Label(lang_frame, text="Select language:", font=("Helvetica", 14)).grid(
             row=0, column=0, sticky="w", padx=(0, 10)
         )
 
@@ -1358,6 +2080,7 @@ class IntroCard(ttk.Frame):
             font=("Helvetica", 13),
         )
         self.language_combo.grid(row=0, column=1, padx=(0, 0))
+        self.language_combo.bind("<<ComboboxSelected>>", self._on_language_selected)
         
         # Style the combobox to be more visible
         style = ttk.Style()
@@ -1370,6 +2093,66 @@ class IntroCard(ttk.Frame):
             relief='solid',
             arrowcolor='#ffffff',
         )
+        
+        # Selected language stats panel (shown when a language with progress is selected)
+        self.selected_stats_frame = ttk.Frame(self.content)
+        self.selected_stats_frame.grid(row=3, column=0, pady=(15, 10))
+        self.selected_stats_frame.grid_remove()  # Hidden by default
+        
+        # Stats labels (will be populated when language is selected)
+        self.selected_lang_title = ttk.Label(
+            self.selected_stats_frame,
+            text="",
+            font=("Helvetica", 16, "bold"),
+            foreground="#ffffff",
+            anchor="center",
+        )
+        self.selected_lang_title.grid(row=0, column=0, columnspan=2, pady=(0, 8))
+        
+        self.selected_level_label = ttk.Label(
+            self.selected_stats_frame,
+            text="",
+            font=("Helvetica", 13),
+            foreground="#7bb3ff",
+        )
+        self.selected_level_label.grid(row=1, column=0, columnspan=2, pady=(0, 4))
+        
+        self.selected_stats_label = ttk.Label(
+            self.selected_stats_frame,
+            text="",
+            font=("Helvetica", 12),
+            foreground="#9bc6ff",
+        )
+        self.selected_stats_label.grid(row=2, column=0, columnspan=2, pady=(0, 4))
+        
+        self.selected_vocab_label = ttk.Label(
+            self.selected_stats_frame,
+            text="",
+            font=("Helvetica", 12),
+            foreground="#9bc6ff",
+        )
+        self.selected_vocab_label.grid(row=3, column=0, columnspan=2, pady=(0, 4))
+        
+        self.selected_streak_label = ttk.Label(
+            self.selected_stats_frame,
+            text="",
+            font=("Helvetica", 12),
+            foreground="#ffb347",
+        )
+        self.selected_streak_label.grid(row=4, column=0, columnspan=2, pady=(0, 8))
+        
+        # Reset button (only shown when there's data to reset)
+        self.reset_language_button = ttk.Button(
+            self.selected_stats_frame,
+            text="🗑 Reset Progress",
+            command=self._on_reset_language_clicked,
+            width=16,
+        )
+        self.reset_language_button.grid(row=5, column=0, columnspan=2, pady=(5, 0))
+        
+        # Style reset button with warning color
+        style.configure("Reset.TButton", font=("Helvetica", 11))
+        self.reset_language_button.configure(style="Reset.TButton")
 
         # API key warning (shown only if API isn't available)
         self.api_warning_label = ttk.Label(
@@ -1381,12 +2164,24 @@ class IntroCard(ttk.Frame):
             anchor="center",
             wraplength=500,
         )
-        self.api_warning_label.grid(row=3, column=0, pady=(10, 10))
+        self.api_warning_label.grid(row=4, column=0, pady=(10, 10))
         
         # Check API availability and show/hide warning
         self.api_available = is_api_available()
         if self.api_available:
             self.api_warning_label.grid_remove()
+        
+        # Database status label
+        self.db_status_label = ttk.Label(
+            self.content,
+            text="",
+            font=("Helvetica", 11),
+            justify="center",
+            anchor="center",
+            wraplength=500,
+        )
+        self.db_status_label.grid(row=5, column=0, pady=(5, 5))
+        self._update_database_status()
         
         self.start_button = ttk.Button(
             self.content,
@@ -1394,7 +2189,7 @@ class IntroCard(ttk.Frame):
             command=self._on_start_clicked,
             state="normal" if self.api_available else "disabled",
         )
-        self.start_button.grid(row=4, column=0, pady=(20, 50))
+        self.start_button.grid(row=6, column=0, pady=(20, 50))
         
         # Style the button to be more prominent
         style = ttk.Style()
@@ -1403,6 +2198,145 @@ class IntroCard(ttk.Frame):
 
         # Responsive wrapping - bind to scrollable canvas for width changes
         self.scrollable.canvas.bind("<Configure>", self._on_content_resize)
+    
+    def _update_database_status(self) -> None:
+        """Update the database status label based on connection state."""
+        if self.controller.database_connected:
+            self.db_status_label.configure(
+                text="✓ Database connected - Progress will be saved",
+                foreground="#69db7c"  # Green
+            )
+        else:
+            error_msg = self.controller.database_error or "Unknown error"
+            self.db_status_label.configure(
+                text=f"⚠ Database not connected - {error_msg}\nProgress will NOT be saved between sessions.",
+                foreground="#ffa94d"  # Orange warning
+            )
+    
+    def _get_language_emoji(self, language: str) -> str:
+        """Get flag emoji for language."""
+        emojis = {
+            "Spanish": "🇪🇸",
+            "French": "🇫🇷",
+            "German": "🇩🇪",
+            "Japanese": "🇯🇵",
+            "Chinese": "🇨🇳",
+            "Arabic": "🇸🇦",
+        }
+        return emojis.get(language, "🌍")
+    
+    def _get_level_color(self, level: str) -> str:
+        """Get color for proficiency level."""
+        colors = {
+            "A1": "#ff6b6b",  # Red - Beginner
+            "A2": "#ffa94d",  # Orange
+            "B1": "#ffd43b",  # Yellow
+            "B2": "#69db7c",  # Green
+            "C1": "#4dabf7",  # Blue
+            "C2": "#da77f2",  # Purple - Mastery
+        }
+        return colors.get(level, "#ffffff")
+    
+    def _on_language_selected(self, event=None) -> None:
+        """Update stats panel and button text based on selected language."""
+        language = self.language_var.get()
+        if not language:
+            self.selected_stats_frame.grid_remove()
+            return
+        
+        db = get_db()
+        profile = db.get_language_profile(language) if db.is_connected() else None
+        
+        if profile and profile.total_sessions > 0:
+            # Show stats panel with existing progress
+            emoji = self._get_language_emoji(language)
+            self.selected_lang_title.configure(text=f"{emoji} {language} Progress")
+            
+            level_color = self._get_level_color(profile.overall_proficiency)
+            self.selected_level_label.configure(
+                text=f"📊 Level: {profile.overall_proficiency} (Fluency: {profile.fluency_score}/100)",
+                foreground=level_color
+            )
+            
+            self.selected_stats_label.configure(
+                text=f"📝 {profile.total_sessions} sessions  •  ⏱ {profile.total_time_minutes} min total"
+            )
+            
+            self.selected_vocab_label.configure(
+                text=f"📖 {profile.total_vocabulary_learned} words learned  •  🎯 {profile.total_cards_completed} cards completed"
+            )
+            
+            if profile.current_streak_days > 0:
+                self.selected_streak_label.configure(
+                    text=f"🔥 {profile.current_streak_days} day streak (best: {profile.longest_streak_days})"
+                )
+                self.selected_streak_label.grid()
+            else:
+                self.selected_streak_label.grid_remove()
+            
+            self.selected_stats_frame.grid()
+            self.start_button.configure(text=f"Continue {language}")
+        else:
+            # Hide stats panel for new language
+            self.selected_stats_frame.grid_remove()
+            self.start_button.configure(text=f"Start Learning {language}")
+    
+    def _on_reset_language_clicked(self) -> None:
+        """Reset all progress for the selected language."""
+        language = self.language_var.get()
+        if not language:
+            return
+        
+        # Get current stats for the confirmation message
+        db = get_db()
+        profile = db.get_language_profile(language) if db.is_connected() else None
+        
+        stats_text = ""
+        if profile and profile.total_sessions > 0:
+            stats_text = (
+                f"\n\nCurrent progress:\n"
+                f"• Level: {profile.overall_proficiency}\n"
+                f"• {profile.total_sessions} sessions\n"
+                f"• {profile.total_vocabulary_learned} words learned\n"
+                f"• {profile.total_time_minutes} minutes practiced"
+            )
+        
+        # Confirm deletion
+        result = messagebox.askyesno(
+            "Reset Progress",
+            f"⚠️ Are you sure you want to reset ALL progress for {language}?\n\n"
+            f"This will permanently delete:\n"
+            f"• Your proficiency level\n"
+            f"• All vocabulary data & strength ratings\n"
+            f"• Session history\n"
+            f"• Grammar patterns\n"
+            f"• Streak data"
+            f"{stats_text}\n\n"
+            f"This action cannot be undone!",
+            icon="warning"
+        )
+        
+        if not result:
+            return
+        
+        try:
+            # Use the proper deletion method
+            success = db.delete_language_progress(language)
+            
+            if success:
+                logger.ui(f"Reset progress for {language}")
+                messagebox.showinfo("Progress Reset", f"All progress for {language} has been reset.\n\nYou can start fresh!")
+            else:
+                messagebox.showerror("Error", "Failed to reset progress. Please try again.")
+                return
+            
+            # Refresh the UI
+            self.selected_stats_frame.grid_remove()
+            self.start_button.configure(text=f"Start Learning {language}")
+            
+        except Exception as e:
+            logger.error(f"Failed to reset language progress: {e}")
+            messagebox.showerror("Error", f"Failed to reset progress: {e}")
 
     def _on_start_clicked(self) -> None:
         # Double-check API availability
@@ -1422,7 +2356,10 @@ class IntroCard(ttk.Frame):
         self.controller.start_session(language)
 
     def reset(self) -> None:
+        """Reset the intro card state."""
         self.language_var.set("")
+        self._on_language_selected()  # Reset button text and hide stats
+        self._update_database_status()  # Refresh database status
 
     def _on_content_resize(self, event: tk.Event) -> None:
         """Adjust intro text wrapping when the window size changes."""
@@ -1464,12 +2401,14 @@ class AssessmentCardView(ttk.Frame):
 
         self.stage_label = ttk.Label(
             self.content,
-            text="Stage 1 of 3",
+            text="Question 1 of 10",
             font=("Helvetica", 14),
             anchor="center",
             foreground="#7bb3ff",  # Light blue text on dark background
         )
         self.stage_label.grid(row=1, column=0, pady=(0, 10))
+        
+        self.total_stages = 10  # Will be updated when assessment cards are loaded
 
         # Loading spinner (starts hidden)
         self.loading_spinner = LoadingSpinner(self.content, text="Generating assessment...")
@@ -1618,7 +2557,7 @@ class AssessmentCardView(ttk.Frame):
         self.current_card = assessment_card
         card = assessment_card.card
 
-        self.stage_label.configure(text=f"Stage {stage} of 3")
+        self.stage_label.configure(text=f"Question {stage} of {self.total_stages}")
 
         # Instruction text we want once everything is ready
         instruction_text = card.instruction or "Please answer the following question:"
@@ -1750,6 +2689,868 @@ class AssessmentCardView(ttk.Frame):
             response,
             answer_index
         )
+
+
+# ---------------------------------------------------------------------------
+# Teaching Card View (Educational content before quiz)
+# ---------------------------------------------------------------------------
+
+class TeachingCardView(ttk.Frame):
+    """
+    Displays teaching content (vocabulary, grammar, phrases) with prev/next navigation.
+    This is shown BEFORE the quiz to teach new concepts.
+    """
+    
+    def __init__(self, parent, controller: LanguageBuddyApp) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self.teaching_plan: Optional[TeachingPlan] = None
+        self.current_index: int = 0
+        
+        # Asset loading tracking
+        self.total_images: int = 0
+        self.loaded_images: int = 0
+        self.total_audio: int = 0
+        self.loaded_audio: int = 0
+        self.more_batches_loading: bool = False
+        
+        # Use scrollable frame for content
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        
+        self.scrollable = ScrollableFrame(self)
+        self.scrollable.grid(row=0, column=0, sticky="nsew")
+        self.content = self.scrollable.content
+        
+        # Configure content to center widgets
+        self.content.columnconfigure(0, weight=1)
+        
+        # Loading spinner
+        self.loading_spinner = LoadingSpinner(self.content, text="Generating lesson content...")
+        self.loading_spinner.grid(row=0, column=0, pady=(100, 40))
+        
+        # Title area
+        self.title_label = ttk.Label(
+            self.content,
+            text="📚 Learning Time",
+            font=("Helvetica", 28, "bold"),
+            foreground="#ffffff",
+            anchor="center",
+        )
+        self.title_label.grid(row=1, column=0, pady=(20, 5))
+        
+        # Theme/subtitle
+        self.theme_label = ttk.Label(
+            self.content,
+            text="",
+            font=("Helvetica", 14),
+            foreground="#7bb3ff",
+            anchor="center",
+        )
+        self.theme_label.grid(row=2, column=0, pady=(0, 5))
+        
+        # Asset loading progress (images/audio)
+        self.asset_progress_label = ttk.Label(
+            self.content,
+            text="",
+            font=("Helvetica", 11),
+            foreground="#69db7c",
+            anchor="center",
+        )
+        self.asset_progress_label.grid(row=3, column=0, pady=(0, 5))
+        self.asset_progress_label.grid_remove()
+        
+        # Progress indicator
+        self.progress_label = ttk.Label(
+            self.content,
+            text="Card 1 of 10",
+            font=("Helvetica", 12),
+            foreground="#9bc6ff",
+            anchor="center",
+        )
+        self.progress_label.grid(row=4, column=0, pady=(0, 15))
+        
+        # Card content frame
+        self.card_frame = ttk.Frame(self.content)
+        self.card_frame.grid(row=5, column=0, padx=30, pady=(10, 10), sticky="ew")
+        self.card_frame.columnconfigure(0, weight=1)
+        
+        # Card title (New Word: der Apfel, Grammar: Articles, etc.)
+        self.card_title_label = ttk.Label(
+            self.card_frame,
+            text="",
+            font=("Helvetica", 22, "bold"),
+            foreground="#ffd43b",  # Yellow highlight for card title
+            anchor="center",
+            wraplength=600,
+        )
+        self.card_title_label.grid(row=0, column=0, pady=(10, 10))
+        
+        # Image area (for vocabulary illustrations)
+        self.responsive_image = ResponsiveImage(self.card_frame)
+        self.responsive_image.grid(row=1, column=0, padx=20, pady=(5, 10))
+        self.responsive_image.grid_remove()
+        
+        # Image loading placeholder
+        self.image_loading_label = ttk.Label(
+            self.card_frame,
+            text="🖼️ Loading image...",
+            font=("Helvetica", 14),
+            foreground="#7bb3ff",
+            anchor="center",
+        )
+        self.image_loading_label.grid(row=1, column=0, pady=(20, 20))
+        self.image_loading_label.grid_remove()
+        
+        # Main word/phrase display
+        self.word_label = ttk.Label(
+            self.card_frame,
+            text="",
+            font=("Helvetica", 36, "bold"),
+            foreground="#ffffff",
+            anchor="center",
+        )
+        self.word_label.grid(row=2, column=0, pady=(10, 5))
+        
+        # Translation
+        self.translation_label = ttk.Label(
+            self.card_frame,
+            text="",
+            font=("Helvetica", 20),
+            foreground="#69db7c",  # Green for translation
+            anchor="center",
+        )
+        self.translation_label.grid(row=3, column=0, pady=(0, 10))
+        
+        # Part of speech / Gender info
+        self.pos_label = ttk.Label(
+            self.card_frame,
+            text="",
+            font=("Helvetica", 12, "italic"),
+            foreground="#9bc6ff",
+            anchor="center",
+        )
+        self.pos_label.grid(row=4, column=0, pady=(0, 10))
+        
+        # Audio player for pronunciation
+        self.audio_player: Optional[AudioPlayer] = None
+        self.audio_frame = ttk.Frame(self.card_frame)
+        self.audio_frame.grid(row=5, column=0, pady=(5, 10))
+        
+        # Explanation text
+        self.explanation_label = ttk.Label(
+            self.card_frame,
+            text="",
+            font=("Helvetica", 14),
+            foreground="#d0d0d0",
+            wraplength=550,
+            justify="center",
+            anchor="center",
+        )
+        self.explanation_label.grid(row=6, column=0, pady=(10, 10), padx=20)
+        
+        # Example sentence frame
+        self.example_frame = ttk.Frame(self.card_frame)
+        self.example_frame.grid(row=7, column=0, pady=(10, 10))
+        
+        self.example_label = ttk.Label(
+            self.example_frame,
+            text="",
+            font=("Helvetica", 16, "italic"),
+            foreground="#ffffff",
+            wraplength=550,
+            justify="center",
+            anchor="center",
+        )
+        self.example_label.grid(row=0, column=0, pady=(0, 5))
+        
+        self.example_translation_label = ttk.Label(
+            self.example_frame,
+            text="",
+            font=("Helvetica", 13),
+            foreground="#9bc6ff",
+            wraplength=550,
+            justify="center",
+            anchor="center",
+        )
+        self.example_translation_label.grid(row=1, column=0)
+        
+        # Grammar examples frame (for grammar lessons)
+        self.grammar_frame = ttk.Frame(self.card_frame)
+        self.grammar_frame.grid(row=8, column=0, pady=(10, 10))
+        self.grammar_frame.columnconfigure(0, weight=1)
+        
+        # Related words
+        self.related_frame = ttk.Frame(self.card_frame)
+        self.related_frame.grid(row=9, column=0, pady=(10, 10))
+        
+        self.related_label = ttk.Label(
+            self.related_frame,
+            text="",
+            font=("Helvetica", 12),
+            foreground="#7bb3ff",
+            wraplength=500,
+            justify="center",
+            anchor="center",
+        )
+        self.related_label.grid(row=0, column=0)
+        
+        # Memory tip
+        self.mnemonic_label = ttk.Label(
+            self.card_frame,
+            text="",
+            font=("Helvetica", 12, "italic"),
+            foreground="#ffa94d",  # Orange for tips
+            wraplength=500,
+            justify="center",
+            anchor="center",
+        )
+        self.mnemonic_label.grid(row=10, column=0, pady=(10, 10))
+        
+        # Navigation buttons frame - MUST be after card_frame (row 5)
+        self.nav_frame = ttk.Frame(self.content)
+        self.nav_frame.grid(row=6, column=0, pady=(20, 10))
+        
+        self.prev_button = ttk.Button(
+            self.nav_frame,
+            text="← Previous",
+            command=self._on_prev,
+            width=15,
+        )
+        self.prev_button.grid(row=0, column=0, padx=10)
+        
+        self.next_button = ttk.Button(
+            self.nav_frame,
+            text="Next →",
+            command=self._on_next,
+            width=15,
+        )
+        self.next_button.grid(row=0, column=1, padx=10)
+        
+        # Skip to quiz button
+        self.skip_button = ttk.Button(
+            self.content,
+            text="Skip to Quiz →",
+            command=self._on_skip_to_quiz,
+            width=20,
+        )
+        self.skip_button.grid(row=7, column=0, pady=(10, 30))
+        
+        # Initially hide content
+        self._hide_content()
+    
+    def _hide_content(self) -> None:
+        """Hide all content elements."""
+        self.title_label.grid_remove()
+        self.theme_label.grid_remove()
+        self.progress_label.grid_remove()
+        self.card_frame.grid_remove()
+        self.nav_frame.grid_remove()
+        self.skip_button.grid_remove()
+    
+    def _show_content(self) -> None:
+        """Show all content elements."""
+        self.title_label.grid()
+        self.theme_label.grid()
+        self.progress_label.grid()
+        self.card_frame.grid()
+        self.nav_frame.grid()
+        self.skip_button.grid()
+    
+    def show_loading(self, message: str = "Generating lesson content...") -> None:
+        """Show loading state."""
+        self._hide_content()
+        self.loading_spinner.text = message
+        self.loading_spinner.label.configure(text=f"{self.loading_spinner.spinner_chars[0]} {message}")
+        self.loading_spinner.grid()
+        self.loading_spinner.start()
+    
+    def hide_loading(self) -> None:
+        """Hide loading state."""
+        self.loading_spinner.stop()
+        self.loading_spinner.grid_remove()
+    
+    def set_teaching_plan(self, teaching_plan: TeachingPlan, more_loading: bool = False) -> None:
+        """Set the teaching plan and display the first card.
+        
+        Args:
+            teaching_plan: The teaching plan to display
+            more_loading: If True, more batches are still loading
+        """
+        self.teaching_plan = teaching_plan
+        self.current_index = 0
+        self.more_batches_loading = more_loading
+        
+        self.hide_loading()
+        self._show_content()
+        
+        # Update theme
+        theme = teaching_plan.theme or "Language Learning"
+        self.theme_label.configure(text=f"Theme: {theme}")
+        
+        # Start generating images for all cards
+        self._start_image_generation()
+        
+        # Start generating audio for all cards
+        self._start_audio_generation()
+        
+        # Show batch loading status if more batches coming
+        if more_loading:
+            self.asset_progress_label.configure(text="⏳ Loading more lessons...")
+            self.asset_progress_label.grid()
+        
+        # Show first card
+        self._render_current_card()
+    
+    def update_loading_progress(self, message: str, batch_num: int, total_batches: int, total_cards: int) -> None:
+        """Update the loading spinner with batch progress."""
+        pct = int((batch_num / total_batches) * 100)
+        self.loading_spinner.text = f"{message}\n{total_cards} cards ready ({pct}%)"
+        self.loading_spinner.label.configure(text=f"{self.loading_spinner.spinner_chars[self.loading_spinner.spinner_index]} {self.loading_spinner.text}")
+    
+    def update_card_count(self, total_cards: int) -> None:
+        """Update the displayed card count when new batches arrive."""
+        if self.teaching_plan:
+            # Update progress label to show new total
+            card = self.teaching_plan.cards[self.current_index] if self.current_index < len(self.teaching_plan.cards) else None
+            if card:
+                card_type_display = "New" if card.is_new else "Review"
+                self.progress_label.configure(
+                    text=f"Card {self.current_index + 1} of {total_cards} • {card_type_display}"
+                )
+    
+    def add_cards_to_generation(self, new_cards: List[TeachingCard]) -> None:
+        """Start generating images/audio for newly added cards."""
+        if not new_cards:
+            return
+        
+        # Add new images to generation queue
+        new_image_prompts = [
+            card.image_prompt for card in new_cards
+            if card.image_prompt and not card.image_path
+        ]
+        if new_image_prompts:
+            self.total_images += len(new_image_prompts)
+            self._update_asset_progress()
+            generate_images_parallel(
+                list(set(new_image_prompts)),
+                lambda prompt, path: self._on_image_generated(prompt, path)
+            )
+        
+        # Add new audio to generation queue
+        language = self.controller.selected_language or "Spanish"
+        for card in new_cards:
+            if card.audio_text and not card.audio_path:
+                self.total_audio += 1
+                self._update_asset_progress()
+                
+                card_index = self.teaching_plan.cards.index(card) if self.teaching_plan else -1
+                def on_audio_done(path: Optional[str], idx: int = card_index) -> None:
+                    def update():
+                        self.loaded_audio += 1
+                        self._update_asset_progress()
+                        if path and self.teaching_plan and idx >= 0:
+                            self.teaching_plan.cards[idx].audio_path = path
+                            if self.current_index == idx:
+                                self._update_audio_player()
+                    self.after(0, update)
+                
+                generate_speech_async(card.audio_text, language, on_audio_done)
+    
+    def mark_batches_complete(self, final_theme: Optional[str] = None) -> None:
+        """Mark that all teaching batches have been loaded."""
+        self.more_batches_loading = False
+        logger.ui("All teaching batches complete")
+        
+        # Update theme if provided
+        if final_theme and self.teaching_plan:
+            self.teaching_plan.theme = final_theme
+            self.theme_label.configure(text=f"Theme: {final_theme}")
+        
+        # Update asset progress to show final state
+        self._update_asset_progress()
+    
+    def _start_image_generation(self) -> None:
+        """Start generating images for all cards that need them."""
+        if not self.teaching_plan:
+            return
+        
+        image_prompts = []
+        for i, card in enumerate(self.teaching_plan.cards):
+            if card.image_prompt and not card.image_path:
+                image_prompts.append(card.image_prompt)
+        
+        # Track totals for progress display
+        self.total_images = len(image_prompts)
+        self.loaded_images = 0
+        self._update_asset_progress()
+        
+        if image_prompts:
+            logger.ui(f"Starting parallel generation of {len(image_prompts)} teaching images...")
+            generate_images_parallel(
+                image_prompts,
+                lambda prompt, path: self._on_image_generated(prompt, path)
+            )
+    
+    def _on_image_generated(self, image_prompt: str, image_path: Optional[str]) -> None:
+        """Called when an image is generated."""
+        if not self.teaching_plan:
+            return
+        
+        def update_ui():
+            # Update progress counter
+            self.loaded_images += 1
+            self._update_asset_progress()
+            
+            if not image_path:
+                return
+                
+            # Update the card that has this image prompt
+            for card in self.teaching_plan.cards:
+                if card.image_prompt == image_prompt:
+                    card.image_path = image_path
+            
+            # Re-render current card if it has this image
+            if self.teaching_plan.cards[self.current_index].image_prompt == image_prompt:
+                self._render_current_card()
+        
+        self.after(0, update_ui)
+    
+    def _start_audio_generation(self) -> None:
+        """Start generating audio for all cards that need TTS."""
+        if not self.teaching_plan:
+            return
+        
+        language = self.controller.selected_language or "Spanish"
+        
+        # Count how many audio files need generation
+        audio_cards = [card for card in self.teaching_plan.cards if card.audio_text and not card.audio_path]
+        self.total_audio = len(audio_cards)
+        self.loaded_audio = 0
+        self._update_asset_progress()
+        
+        for i, card in enumerate(self.teaching_plan.cards):
+            if card.audio_text and not card.audio_path:
+                def on_audio_done(path: Optional[str], card_index: int = i) -> None:
+                    def update():
+                        # Update progress counter
+                        self.loaded_audio += 1
+                        self._update_asset_progress()
+                        
+                        if path and self.teaching_plan:
+                            self.teaching_plan.cards[card_index].audio_path = path
+                            # Re-render if current card
+                            if self.current_index == card_index:
+                                self._update_audio_player()
+                    self.after(0, update)
+                
+                generate_speech_async(card.audio_text, language, on_audio_done)
+    
+    def _update_asset_progress(self) -> None:
+        """Update the asset loading progress display."""
+        parts = []
+        
+        if self.total_images > 0:
+            if self.loaded_images < self.total_images:
+                parts.append(f"🖼️ {self.loaded_images}/{self.total_images} images")
+            else:
+                parts.append(f"✓ {self.total_images} images")
+        
+        if self.total_audio > 0:
+            if self.loaded_audio < self.total_audio:
+                parts.append(f"🔊 {self.loaded_audio}/{self.total_audio} audio")
+            else:
+                parts.append(f"✓ {self.total_audio} audio")
+        
+        if parts:
+            progress_text = " • ".join(parts)
+            self.asset_progress_label.configure(text=progress_text)
+            self.asset_progress_label.grid()
+            
+            # Change color when all done
+            if self.loaded_images >= self.total_images and self.loaded_audio >= self.total_audio:
+                self.asset_progress_label.configure(foreground="#69db7c")  # Green
+            else:
+                self.asset_progress_label.configure(foreground="#7bb3ff")  # Blue
+        else:
+            self.asset_progress_label.grid_remove()
+    
+    def _render_current_card(self) -> None:
+        """Render the current teaching card."""
+        if not self.teaching_plan or self.current_index >= len(self.teaching_plan.cards):
+            return
+        
+        card = self.teaching_plan.cards[self.current_index]
+        total = len(self.teaching_plan.cards)
+        
+        # Update progress
+        card_type_display = "New" if card.is_new else "Review"
+        self.progress_label.configure(
+            text=f"Card {self.current_index + 1} of {total} • {card_type_display}"
+        )
+        
+        # Update navigation buttons
+        self.prev_button.configure(state="normal" if self.current_index > 0 else "disabled")
+        
+        if self.current_index >= total - 1:
+            self.next_button.configure(text="Start Quiz →")
+            # Hide skip button on last card (redundant with Start Quiz)
+            self.skip_button.grid_remove()
+        else:
+            self.next_button.configure(text="Next →")
+            # Show skip button on other cards
+            self.skip_button.grid()
+        
+        # Clear grammar frame
+        for widget in self.grammar_frame.winfo_children():
+            widget.destroy()
+        
+        # Render based on card type
+        if card.type == "vocabulary_intro" or card.type == "phrase_lesson" or card.type == "concept_review":
+            self._render_vocabulary_card(card)
+        elif card.type == "grammar_lesson":
+            self._render_grammar_card(card)
+        elif card.type == "conjugation_table":
+            self._render_conjugation_card(card)
+        else:
+            self._render_vocabulary_card(card)  # Default
+        
+        # Scroll to top
+        self.scrollable.scroll_to_top()
+    
+    def _render_vocabulary_card(self, card: TeachingCard) -> None:
+        """Render a vocabulary/phrase card."""
+        # Title
+        self.card_title_label.configure(text=card.title)
+        
+        # Image - show placeholder if loading
+        if card.image_path:
+            self.responsive_image.set_image(card.image_path)
+            self.responsive_image.grid()
+            self.image_loading_label.grid_remove()
+        elif card.image_prompt:
+            # Image is being generated - show loading placeholder
+            self.responsive_image.grid_remove()
+            self.image_loading_label.configure(text="🖼️ Loading image...")
+            self.image_loading_label.grid()
+        else:
+            self.responsive_image.grid_remove()
+            self.image_loading_label.grid_remove()
+        
+        # Main word
+        self.word_label.configure(text=card.word or "")
+        self.word_label.grid() if card.word else self.word_label.grid_remove()
+        
+        # Translation
+        self.translation_label.configure(text=card.translation or "")
+        self.translation_label.grid() if card.translation else self.translation_label.grid_remove()
+        
+        # Part of speech / Gender
+        pos_text = ""
+        if card.part_of_speech:
+            pos_text = card.part_of_speech
+        if card.gender:
+            pos_text += f" • {card.gender}"
+        if card.pronunciation_hint:
+            pos_text += f" • 🔊 {card.pronunciation_hint}"
+        self.pos_label.configure(text=pos_text)
+        self.pos_label.grid() if pos_text else self.pos_label.grid_remove()
+        
+        # Audio player
+        self._update_audio_player()
+        
+        # Explanation
+        self.explanation_label.configure(text=card.explanation or "")
+        self.explanation_label.grid() if card.explanation else self.explanation_label.grid_remove()
+        
+        # Example sentence
+        self.example_label.configure(text=f'"{card.example_sentence}"' if card.example_sentence else "")
+        self.example_label.grid() if card.example_sentence else self.example_label.grid_remove()
+        
+        self.example_translation_label.configure(text=card.example_translation or "")
+        self.example_translation_label.grid() if card.example_translation else self.example_translation_label.grid_remove()
+        
+        self.example_frame.grid() if card.example_sentence else self.example_frame.grid_remove()
+        
+        # Related words
+        if card.related_words:
+            related_text = "Related: " + " • ".join(card.related_words[:5])
+            self.related_label.configure(text=related_text)
+            self.related_frame.grid()
+        else:
+            self.related_frame.grid_remove()
+        
+        # Memory tip
+        if card.mnemonic:
+            self.mnemonic_label.configure(text=f"💡 Tip: {card.mnemonic}")
+            self.mnemonic_label.grid()
+        else:
+            self.mnemonic_label.grid_remove()
+        
+        # Hide grammar frame
+        self.grammar_frame.grid_remove()
+    
+    def _render_grammar_card(self, card: TeachingCard) -> None:
+        """Render a grammar lesson card."""
+        # Title
+        self.card_title_label.configure(text=card.title)
+        
+        # Hide image for grammar cards
+        self.responsive_image.grid_remove()
+        
+        # Grammar rule as main text
+        self.word_label.configure(text=card.grammar_rule or "")
+        self.word_label.grid() if card.grammar_rule else self.word_label.grid_remove()
+        
+        # Hide translation
+        self.translation_label.grid_remove()
+        self.pos_label.grid_remove()
+        
+        # Audio player
+        self._update_audio_player()
+        
+        # Explanation
+        self.explanation_label.configure(text=card.explanation or "")
+        self.explanation_label.grid() if card.explanation else self.explanation_label.grid_remove()
+        
+        # Hide example frame
+        self.example_frame.grid_remove()
+        
+        # Grammar examples
+        if card.grammar_examples:
+            self.grammar_frame.grid()
+            
+            examples_title = ttk.Label(
+                self.grammar_frame,
+                text="Examples:",
+                font=("Helvetica", 14, "bold"),
+                foreground="#7bb3ff",
+            )
+            examples_title.grid(row=0, column=0, pady=(5, 10), sticky="w")
+            
+            for i, example in enumerate(card.grammar_examples[:5]):
+                target = example.get("target", "")
+                english = example.get("english", "")
+                
+                example_frame = ttk.Frame(self.grammar_frame)
+                example_frame.grid(row=i+1, column=0, pady=5, sticky="w", padx=20)
+                
+                target_label = ttk.Label(
+                    example_frame,
+                    text=target,
+                    font=("Helvetica", 14),
+                    foreground="#ffffff",
+                )
+                target_label.grid(row=0, column=0, sticky="w")
+                
+                english_label = ttk.Label(
+                    example_frame,
+                    text=f"→ {english}",
+                    font=("Helvetica", 12),
+                    foreground="#9bc6ff",
+                )
+                english_label.grid(row=1, column=0, sticky="w", padx=(10, 0))
+        else:
+            self.grammar_frame.grid_remove()
+        
+        # Common mistakes as mnemonic
+        if card.common_mistakes:
+            mistakes_text = "⚠️ Watch out: " + " | ".join(card.common_mistakes[:3])
+            self.mnemonic_label.configure(text=mistakes_text)
+            self.mnemonic_label.grid()
+        else:
+            self.mnemonic_label.grid_remove()
+        
+        # Related words
+        self.related_frame.grid_remove()
+    
+    def _render_conjugation_card(self, card: TeachingCard) -> None:
+        """Render a verb conjugation table card."""
+        # Title
+        self.card_title_label.configure(text=card.title or f"Conjugation: {card.infinitive}")
+        
+        # Hide standard vocab elements
+        self.responsive_image.grid_remove()
+        self.image_loading_label.grid_remove()
+        
+        # Show infinitive and translation
+        infinitive_text = card.infinitive or card.word or ""
+        self.word_label.configure(text=infinitive_text)
+        self.word_label.grid() if infinitive_text else self.word_label.grid_remove()
+        
+        translation_text = card.translation or ""
+        if card.verb_type:
+            translation_text += f" ({card.verb_type})"
+        self.translation_label.configure(text=translation_text)
+        self.translation_label.grid() if translation_text else self.translation_label.grid_remove()
+        
+        # Show tense
+        if card.tense:
+            self.pos_label.configure(text=f"📖 {card.tense} Tense")
+            self.pos_label.grid()
+        else:
+            self.pos_label.grid_remove()
+        
+        # Audio
+        self._update_audio_player()
+        
+        # Explanation
+        self.explanation_label.configure(text=card.explanation or "")
+        self.explanation_label.grid() if card.explanation else self.explanation_label.grid_remove()
+        
+        # Hide example frame
+        self.example_frame.grid_remove()
+        
+        # Build conjugation table in grammar_frame
+        self.grammar_frame.grid()
+        for widget in self.grammar_frame.winfo_children():
+            widget.destroy()
+        
+        # Table title
+        table_title = ttk.Label(
+            self.grammar_frame,
+            text="📋 Conjugation Table",
+            font=("Helvetica", 16, "bold"),
+            foreground="#ffd43b",
+        )
+        table_title.grid(row=0, column=0, columnspan=2, pady=(10, 15))
+        
+        # Create conjugation table
+        if card.conjugations:
+            row_idx = 1
+            
+            # Define the order of pronouns for different languages
+            pronoun_order = ["ich", "du", "er/sie/es", "wir", "ihr", "sie/Sie",  # German
+                           "je", "tu", "il/elle", "nous", "vous", "ils/elles",  # French
+                           "yo", "tú", "él/ella", "nosotros", "vosotros", "ellos/ellas",  # Spanish
+                           "I", "you", "he/she", "we", "you (pl)", "they"]  # Fallback
+            
+            # Sort conjugations by pronoun order if possible
+            sorted_conjugations = []
+            for pronoun in pronoun_order:
+                if pronoun in card.conjugations:
+                    sorted_conjugations.append((pronoun, card.conjugations[pronoun]))
+            # Add any remaining conjugations not in the order
+            for pronoun, form in card.conjugations.items():
+                if (pronoun, form) not in sorted_conjugations:
+                    sorted_conjugations.append((pronoun, form))
+            
+            for pronoun, conjugated_form in sorted_conjugations:
+                # Pronoun column
+                pronoun_label = ttk.Label(
+                    self.grammar_frame,
+                    text=pronoun,
+                    font=("Helvetica", 14),
+                    foreground="#9bc6ff",
+                    width=12,
+                    anchor="e",
+                )
+                pronoun_label.grid(row=row_idx, column=0, padx=(20, 10), pady=3, sticky="e")
+                
+                # Conjugated form column
+                form_label = ttk.Label(
+                    self.grammar_frame,
+                    text=conjugated_form,
+                    font=("Helvetica", 16, "bold"),
+                    foreground="#ffffff",
+                    anchor="w",
+                )
+                form_label.grid(row=row_idx, column=1, padx=(10, 20), pady=3, sticky="w")
+                
+                row_idx += 1
+        
+        # Add example sentences
+        if card.conjugation_examples:
+            examples_title = ttk.Label(
+                self.grammar_frame,
+                text="📝 Example Sentences",
+                font=("Helvetica", 14, "bold"),
+                foreground="#69db7c",
+            )
+            examples_title.grid(row=row_idx, column=0, columnspan=2, pady=(20, 10))
+            row_idx += 1
+            
+            for example in card.conjugation_examples[:4]:
+                sentence = example.get("sentence", "")
+                translation = example.get("translation", "")
+                
+                if sentence:
+                    sentence_label = ttk.Label(
+                        self.grammar_frame,
+                        text=f"• {sentence}",
+                        font=("Helvetica", 13),
+                        foreground="#ffffff",
+                        wraplength=500,
+                    )
+                    sentence_label.grid(row=row_idx, column=0, columnspan=2, padx=30, pady=(5, 0), sticky="w")
+                    row_idx += 1
+                    
+                    if translation:
+                        trans_label = ttk.Label(
+                            self.grammar_frame,
+                            text=f"  → {translation}",
+                            font=("Helvetica", 12),
+                            foreground="#9bc6ff",
+                            wraplength=500,
+                        )
+                        trans_label.grid(row=row_idx, column=0, columnspan=2, padx=40, pady=(0, 5), sticky="w")
+                        row_idx += 1
+        
+        # Hide related/mnemonic for conjugation cards
+        self.related_frame.grid_remove()
+        self.mnemonic_label.grid_remove()
+    
+    def _update_audio_player(self) -> None:
+        """Update or create audio player for current card."""
+        if not self.teaching_plan:
+            return
+        
+        card = self.teaching_plan.cards[self.current_index]
+        
+        # Clear existing audio player
+        for widget in self.audio_frame.winfo_children():
+            widget.destroy()
+        
+        if card.audio_path:
+            self.audio_player = AudioPlayer(self.audio_frame)
+            self.audio_player.pack(pady=5)
+            self.audio_player.set_audio(card.audio_path)
+            self.audio_frame.grid()
+        elif card.audio_text:
+            # Audio is being generated
+            loading_label = ttk.Label(
+                self.audio_frame,
+                text="🔊 Generating audio...",
+                font=("Helvetica", 11),
+                foreground="#7bb3ff",
+            )
+            loading_label.pack(pady=5)
+            self.audio_frame.grid()
+        else:
+            self.audio_frame.grid_remove()
+    
+    def _on_prev(self) -> None:
+        """Go to previous card."""
+        if self.current_index > 0:
+            self.current_index -= 1
+            self._render_current_card()
+    
+    def _on_next(self) -> None:
+        """Go to next card or start quiz."""
+        if not self.teaching_plan:
+            return
+        
+        if self.current_index >= len(self.teaching_plan.cards) - 1:
+            # Finished teaching, proceed to quiz
+            self._on_skip_to_quiz()
+        else:
+            self.current_index += 1
+            self._render_current_card()
+    
+    def _on_skip_to_quiz(self) -> None:
+        """Skip to the quiz section."""
+        logger.ui("User finished teaching section, proceeding to quiz...")
+        self.controller.proceed_to_quiz()
 
 
 # ---------------------------------------------------------------------------
@@ -2082,7 +3883,10 @@ class LessonCardView(ttk.Frame):
         
         # Create or update audio player - place it in content frame (row 3, where image normally goes)
         if not self.audio_player:
-            self.audio_player = AudioPlayer(self.content)
+            self.audio_player = AudioPlayer(
+                self.content,
+                on_skip=self._on_skip_audio
+            )
         
         # Place audio player in the content area (between progress label and question)
         self.audio_player.grid(row=3, column=0, pady=(10, 10))
@@ -2146,7 +3950,8 @@ class LessonCardView(ttk.Frame):
         if not self.speech_recorder:
             self.speech_recorder = SpeechRecorder(
                 self.content,
-                on_recording_complete=self._on_recording_complete
+                on_recording_complete=self._on_recording_complete,
+                on_skip=self._on_skip_speaking
             )
         
         # Set the prompt and show the recorder
@@ -2178,6 +3983,59 @@ class LessonCardView(ttk.Frame):
         
         # Transcribe in background
         transcribe_audio_async(audio_path, language, on_transcription_complete)
+    
+    def _on_skip_audio(self) -> None:
+        """Handle skipping an audio exercise (TTS listening)."""
+        logger.ui("Skipping audio exercise")
+        
+        plan = self.controller.lesson_plan
+        if not plan or self.controller.lesson_index >= len(plan.cards):
+            return
+        
+        card = plan.cards[self.controller.lesson_index]
+        
+        # Mark as skipped with partial credit
+        card.is_correct = False
+        card.card_score = 0
+        card.user_response = "[SKIPPED - Audio exercise]"
+        card.feedback = "Exercise skipped. Audio exercises help develop listening skills - try them when you can!"
+        
+        # Show brief feedback then move to next card
+        self._show_skip_feedback("Audio exercise skipped", card)
+    
+    def _on_skip_speaking(self) -> None:
+        """Handle skipping a speaking exercise (STT recording)."""
+        logger.ui("Skipping speaking exercise")
+        
+        plan = self.controller.lesson_plan
+        if not plan or self.controller.lesson_index >= len(plan.cards):
+            return
+        
+        card = plan.cards[self.controller.lesson_index]
+        
+        # Mark as skipped with partial credit
+        card.is_correct = False
+        card.card_score = 0
+        card.user_response = "[SKIPPED - Speaking exercise]"
+        card.feedback = "Exercise skipped. Speaking practice helps with pronunciation - try it when you can!"
+        
+        # Show brief feedback then move to next card
+        self._show_skip_feedback("Speaking exercise skipped", card)
+    
+    def _show_skip_feedback(self, message: str, card: LessonCard) -> None:
+        """Show brief feedback for skipped exercises and move to next card."""
+        # Create a simple feedback display
+        feedback_data = {
+            "is_correct": False,
+            "card_score": 0,
+            "feedback": card.feedback,
+            "correct_answer": card.correct_answer or card.speaking_prompt or "",
+            "alternatives": [],
+            "vocabulary_expansion": card.vocabulary_expansion or [],
+        }
+        
+        # Show the feedback
+        self.show_feedback(feedback_data)
     
     def _generate_audio_for_card(self, card: LessonCard) -> None:
         """Generate TTS audio for a card asynchronously."""
@@ -2395,6 +4253,335 @@ class LessonCardView(ttk.Frame):
 
 
 # ---------------------------------------------------------------------------
+# Assessment Results Card
+# ---------------------------------------------------------------------------
+
+class AssessmentResultsCard(ttk.Frame):
+    """Displays the assessment results with detailed feedback before moving to lessons."""
+    
+    def __init__(self, parent, controller: "LanguageBuddyApp") -> None:
+        super().__init__(parent)
+        self.controller = controller
+        
+        # Use scrollable frame for content
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        
+        self.scrollable = ScrollableFrame(self)
+        self.scrollable.grid(row=0, column=0, sticky="nsew")
+        self.content = self.scrollable.content
+        
+        # Configure content to center widgets
+        self.content.columnconfigure(0, weight=1)
+        
+        # Title
+        self.title_label = ttk.Label(
+            self.content,
+            text="📊 Assessment Complete",
+            font=("Helvetica", 24, "bold"),
+            foreground="#ffffff",
+            anchor="center",
+        )
+        self.title_label.grid(row=0, column=0, pady=(30, 20), padx=20)
+        
+        # Results container
+        self.results_frame = ttk.Frame(self.content)
+        self.results_frame.grid(row=1, column=0, padx=40, pady=10, sticky="ew")
+        self.results_frame.columnconfigure(0, weight=1)
+        
+        # Continue button
+        self.continue_button = ttk.Button(
+            self.content,
+            text="Start Learning →",
+            command=self._on_continue_clicked,
+        )
+        self.continue_button.grid(row=2, column=0, pady=(30, 40))
+        
+        # Style the button
+        style = ttk.Style()
+        style.configure("Continue.TButton", font=("Helvetica", 14, "bold"), padding=10)
+        self.continue_button.configure(style="Continue.TButton")
+    
+    def show_results(self, assessment_result: AssessmentResult, language: str) -> None:
+        """Display the assessment results with detailed feedback."""
+        # Clear previous results
+        for widget in self.results_frame.winfo_children():
+            widget.destroy()
+        
+        row = 0
+        
+        # === PROFICIENCY LEVEL SECTION ===
+        level_frame = ttk.Frame(self.results_frame)
+        level_frame.grid(row=row, column=0, pady=(0, 25), sticky="ew")
+        level_frame.columnconfigure(0, weight=1)
+        
+        # Big proficiency display
+        level_color = self._get_level_color(assessment_result.proficiency)
+        level_label = ttk.Label(
+            level_frame,
+            text=assessment_result.proficiency,
+            font=("Helvetica", 72, "bold"),
+            foreground=level_color,
+            anchor="center",
+        )
+        level_label.grid(row=0, column=0)
+        
+        level_name = self._get_level_name(assessment_result.proficiency)
+        level_name_label = ttk.Label(
+            level_frame,
+            text=level_name,
+            font=("Helvetica", 18),
+            foreground="#d0d0d0",
+            anchor="center",
+        )
+        level_name_label.grid(row=1, column=0, pady=(5, 0))
+        
+        # Language label
+        lang_label = ttk.Label(
+            level_frame,
+            text=f"in {language}",
+            font=("Helvetica", 14),
+            foreground="#7bb3ff",
+            anchor="center",
+        )
+        lang_label.grid(row=2, column=0, pady=(5, 0))
+        
+        row += 1
+        
+        # === SKILLS BREAKDOWN SECTION ===
+        skills_section = self._create_section(
+            self.results_frame, row, "📈 Skills Breakdown"
+        )
+        row += 1
+        
+        skills_frame = ttk.Frame(self.results_frame)
+        skills_frame.grid(row=row, column=0, pady=(0, 20), padx=20, sticky="ew")
+        skills_frame.columnconfigure((0, 1, 2), weight=1)
+        
+        # Vocabulary
+        self._create_skill_card(skills_frame, 0, "📖 Vocabulary", 
+                               assessment_result.vocabulary_level)
+        # Grammar
+        self._create_skill_card(skills_frame, 1, "✏️ Grammar", 
+                               assessment_result.grammar_level)
+        # Fluency
+        fluency_level = self._score_to_level(assessment_result.fluency_score)
+        self._create_skill_card(skills_frame, 2, "💬 Fluency", 
+                               f"{assessment_result.fluency_score}/100")
+        
+        row += 1
+        
+        # === STRENGTHS SECTION ===
+        if assessment_result.strengths:
+            self._create_section(self.results_frame, row, "✅ Your Strengths")
+            row += 1
+            
+            strengths_frame = ttk.Frame(self.results_frame)
+            strengths_frame.grid(row=row, column=0, pady=(0, 20), padx=30, sticky="w")
+            
+            for i, strength in enumerate(assessment_result.strengths[:5]):
+                strength_label = ttk.Label(
+                    strengths_frame,
+                    text=f"• {strength}",
+                    font=("Helvetica", 13),
+                    foreground="#69db7c",
+                    wraplength=500,
+                    justify="left",
+                )
+                strength_label.grid(row=i, column=0, sticky="w", pady=2)
+            row += 1
+        
+        # === AREAS TO IMPROVE SECTION ===
+        if assessment_result.weaknesses:
+            self._create_section(self.results_frame, row, "🎯 Areas to Improve")
+            row += 1
+            
+            weaknesses_frame = ttk.Frame(self.results_frame)
+            weaknesses_frame.grid(row=row, column=0, pady=(0, 20), padx=30, sticky="w")
+            
+            for i, weakness in enumerate(assessment_result.weaknesses[:5]):
+                weakness_label = ttk.Label(
+                    weaknesses_frame,
+                    text=f"• {weakness}",
+                    font=("Helvetica", 13),
+                    foreground="#ffa94d",
+                    wraplength=500,
+                    justify="left",
+                )
+                weakness_label.grid(row=i, column=0, sticky="w", pady=2)
+            row += 1
+        
+        # === RECOMMENDATIONS SECTION ===
+        if assessment_result.recommendations:
+            self._create_section(self.results_frame, row, "💡 Recommendations")
+            row += 1
+            
+            recs_frame = ttk.Frame(self.results_frame)
+            recs_frame.grid(row=row, column=0, pady=(0, 20), padx=30, sticky="w")
+            
+            for i, rec in enumerate(assessment_result.recommendations[:5]):
+                rec_label = ttk.Label(
+                    recs_frame,
+                    text=f"• {rec}",
+                    font=("Helvetica", 13),
+                    foreground="#9bc6ff",
+                    wraplength=500,
+                    justify="left",
+                )
+                rec_label.grid(row=i, column=0, sticky="w", pady=2)
+            row += 1
+        
+        # === LEVEL EXPLANATION SECTION ===
+        self._create_section(self.results_frame, row, "📚 What This Level Means")
+        row += 1
+        
+        explanation = self._get_level_explanation(assessment_result.proficiency)
+        explanation_label = ttk.Label(
+            self.results_frame,
+            text=explanation,
+            font=("Helvetica", 12),
+            foreground="#d0d0d0",
+            wraplength=550,
+            justify="left",
+        )
+        explanation_label.grid(row=row, column=0, pady=(0, 20), padx=30, sticky="w")
+        
+        # Scroll to top
+        self.scrollable.canvas.yview_moveto(0)
+    
+    def _create_section(self, parent, row: int, title: str) -> ttk.Label:
+        """Create a section header."""
+        label = ttk.Label(
+            parent,
+            text=title,
+            font=("Helvetica", 16, "bold"),
+            foreground="#7bb3ff",
+        )
+        label.grid(row=row, column=0, pady=(15, 10), padx=20, sticky="w")
+        return label
+    
+    def _create_skill_card(self, parent, col: int, skill_name: str, level: str) -> None:
+        """Create a skill indicator card."""
+        frame = ttk.Frame(parent)
+        frame.grid(row=0, column=col, padx=10, pady=5)
+        
+        name_label = ttk.Label(
+            frame,
+            text=skill_name,
+            font=("Helvetica", 12),
+            foreground="#d0d0d0",
+            anchor="center",
+        )
+        name_label.grid(row=0, column=0)
+        
+        # Determine color based on level
+        if "/" in level:  # It's a score like "75/100"
+            color = "#7bb3ff"
+        else:
+            color = self._get_level_color(level)
+        
+        level_label = ttk.Label(
+            frame,
+            text=level,
+            font=("Helvetica", 20, "bold"),
+            foreground=color,
+            anchor="center",
+        )
+        level_label.grid(row=1, column=0, pady=(5, 0))
+    
+    def _get_level_color(self, level: str) -> str:
+        """Get color for proficiency level."""
+        colors = {
+            "A1": "#ff6b6b",  # Red - Beginner
+            "A2": "#ffa94d",  # Orange
+            "B1": "#ffd43b",  # Yellow
+            "B2": "#69db7c",  # Green
+            "C1": "#4dabf7",  # Blue
+            "C2": "#da77f2",  # Purple - Mastery
+        }
+        return colors.get(level, "#ffffff")
+    
+    def _get_level_name(self, level: str) -> str:
+        """Get human-readable name for level."""
+        names = {
+            "A1": "Beginner",
+            "A2": "Elementary",
+            "B1": "Intermediate",
+            "B2": "Upper Intermediate",
+            "C1": "Advanced",
+            "C2": "Proficient / Near-Native",
+        }
+        return names.get(level, "Unknown")
+    
+    def _score_to_level(self, score: int) -> str:
+        """Convert fluency score to approximate level."""
+        if score >= 90:
+            return "C2"
+        elif score >= 75:
+            return "C1"
+        elif score >= 60:
+            return "B2"
+        elif score >= 45:
+            return "B1"
+        elif score >= 30:
+            return "A2"
+        else:
+            return "A1"
+    
+    def _get_level_explanation(self, level: str) -> str:
+        """Get detailed explanation of what the level means."""
+        explanations = {
+            "A1": (
+                "At A1 (Beginner), you can understand and use familiar everyday expressions "
+                "and very basic phrases. You can introduce yourself and others, ask and answer "
+                "questions about personal details such as where you live, people you know, "
+                "and things you have. You can interact in a simple way provided the other "
+                "person talks slowly and clearly."
+            ),
+            "A2": (
+                "At A2 (Elementary), you can understand sentences and frequently used expressions "
+                "related to areas of most immediate relevance (e.g., personal and family information, "
+                "shopping, local geography, employment). You can communicate in simple and routine "
+                "tasks requiring a direct exchange of information on familiar matters. You can "
+                "describe aspects of your background and immediate environment."
+            ),
+            "B1": (
+                "At B1 (Intermediate), you can understand the main points of clear standard input "
+                "on familiar matters regularly encountered in work, school, leisure, etc. You can "
+                "deal with most situations likely to arise while traveling. You can produce simple "
+                "connected text on familiar topics. You can describe experiences, events, dreams, "
+                "hopes, and ambitions and briefly give reasons for opinions and plans."
+            ),
+            "B2": (
+                "At B2 (Upper Intermediate), you can understand the main ideas of complex text on "
+                "both concrete and abstract topics, including technical discussions in your field. "
+                "You can interact with a degree of fluency and spontaneity that makes regular "
+                "interaction with native speakers quite possible without strain. You can produce "
+                "clear, detailed text on a wide range of subjects."
+            ),
+            "C1": (
+                "At C1 (Advanced), you can understand a wide range of demanding, longer texts and "
+                "recognize implicit meaning. You can express yourself fluently and spontaneously "
+                "without much obvious searching for expressions. You can use language flexibly "
+                "and effectively for social, academic, and professional purposes. You can produce "
+                "clear, well-structured, detailed text on complex subjects."
+            ),
+            "C2": (
+                "At C2 (Proficient), you can understand with ease virtually everything heard or read. "
+                "You can summarize information from different spoken and written sources, "
+                "reconstructing arguments and accounts in a coherent presentation. You can express "
+                "yourself spontaneously, very fluently and precisely, differentiating finer shades "
+                "of meaning even in the most complex situations."
+            ),
+        }
+        return explanations.get(level, "Level information not available.")
+    
+    def _on_continue_clicked(self) -> None:
+        """Handle continue button click - proceed to lesson generation."""
+        self.controller.proceed_to_lessons()
+
+
+# ---------------------------------------------------------------------------
 # Summary card
 # ---------------------------------------------------------------------------
 
@@ -2479,7 +4666,7 @@ class SummaryCard(ttk.Frame):
         messagebox.showerror("Error", f"Failed to generate summary: {error}")
 
     def set_summary(self, summary: Dict[str, Any], lesson_plan: Optional[LessonPlan] = None) -> None:
-        """Set summary from final summary dict."""
+        """Set summary from final summary dict with change markers."""
         self.hide_loading()
         self.scrollable.scroll_to_top()
         
@@ -2495,23 +4682,74 @@ class SummaryCard(ttk.Frame):
             # Add lesson plan total score if available
             if lesson_plan:
                 overall_score = lesson_plan.total_score
+            
+            # Get session stats for change markers
+            stats = self.controller.session_stats
+            teaching_plan = self.controller.teaching_plan
+            
+            # Build change markers section
+            change_lines = []
+            
+            if stats:
+                # Words learned this session
+                if teaching_plan:
+                    new_words = teaching_plan.new_words_count
+                    if new_words > 0:
+                        change_lines.append(f"📚 +{new_words} new words learned")
+                    if teaching_plan.review_words_count > 0:
+                        change_lines.append(f"🔄 {teaching_plan.review_words_count} words reviewed")
+                
+                # Fluency change
+                fluency_after = self.controller.assessment_result.fluency_score if self.controller.assessment_result else 0
+                fluency_diff = fluency_after - stats.fluency_before
+                if fluency_diff > 0:
+                    change_lines.append(f"📈 Fluency: +{fluency_diff} ({stats.fluency_before} → {fluency_after})")
+                elif fluency_diff < 0:
+                    change_lines.append(f"📉 Fluency: {fluency_diff} ({stats.fluency_before} → {fluency_after})")
+                else:
+                    change_lines.append(f"📊 Fluency: {fluency_after}/100")
+                
+                # Proficiency level change
+                prof_after = self.controller.assessment_result.proficiency if self.controller.assessment_result else "A1"
+                if stats.proficiency_before != prof_after:
+                    change_lines.append(f"🎯 Level: {stats.proficiency_before} → {prof_after}")
+            
+            # Quiz performance
+            if lesson_plan and lesson_plan.cards:
+                correct = sum(1 for card in lesson_plan.cards if card.is_correct)
+                total = len(lesson_plan.cards)
+                change_lines.append(f"✅ Quiz: {correct}/{total} correct ({overall_score}%)")
 
             text_lines = [
-                f"Overall Score: {overall_score}/100",
+                "═══════════════════════════════════════",
+                "📊 SESSION RESULTS",
+                "═══════════════════════════════════════",
                 "",
+            ]
+            
+            if change_lines:
+                text_lines.extend([
+                    "📈 Your Progress This Session:",
+                    *[f"  {line}" for line in change_lines],
+                    "",
+                ])
+            
+            text_lines.extend([
                 f"Progress: {proficiency_improvement}",
                 "",
-                "Strengths:",
+                "✅ Strengths:",
                 *[f"  • {s}" for s in (strengths or ["Keep up the good work!"])],
                 "",
-                "Areas to Improve:",
+                "🎯 Areas to Improve:",
                 *[f"  • {a}" for a in (areas_to_improve or ["Continue practicing"])],
                 "",
-                "Study Suggestions:",
+                "📖 Study Suggestions:",
                 *[f"  • {s}" for s in (study_suggestions or ["Practice regularly", "Review vocabulary daily"])],
                 "",
-                "Would you like to try another assessment?",
-            ]
+                "═══════════════════════════════════════",
+                "",
+                "Ready for another lesson?",
+            ])
             text = "\n".join(text_lines)
 
         self.summary_label.configure(text=text)

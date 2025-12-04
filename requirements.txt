@@ -4,3 +4,4 @@ pillow>=10.0.0
 pygame>=2.5.0
 sounddevice>=0.4.6
 soundfile>=0.12.1
+firebase-admin>=6.0.0
