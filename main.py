@@ -73,6 +73,7 @@ from core.api import (
     generate_lesson_plan_from_assessment_responses,  # Optimized combined function
     generate_teaching_content,  # Teaching content generation
     evaluate_card_response,
+    evaluate_quiz_performance,  # Re-evaluate proficiency after quiz
     generate_final_summary,
     generate_image_async,
     generate_images_parallel,  # Parallel image generation
@@ -509,14 +510,13 @@ class AudioPlayer(ttk.Frame):
     Uses pygame for cross-platform audio playback.
     """
     
-    def __init__(self, parent, on_skip: Optional[Callable[[], None]] = None, **kwargs) -> None:
+    def __init__(self, parent, **kwargs) -> None:
         super().__init__(parent, **kwargs)
         
         self._audio_path: Optional[str] = None
         self._is_playing: bool = False
         self._is_loaded: bool = False
         self._playback_finished: bool = False
-        self._on_skip = on_skip
         
         # Create control frame
         self.control_frame = ttk.Frame(self)
@@ -531,15 +531,6 @@ class AudioPlayer(ttk.Frame):
         )
         self.play_button.pack(side="left", padx=5)
         
-        # Skip button - for users who can't listen to audio
-        self.skip_button = ttk.Button(
-            self.control_frame,
-            text="⏭ Skip Audio",
-            command=self._on_skip_click,
-            width=12,
-        )
-        self.skip_button.pack(side="left", padx=5)
-        
         # Status label
         self.status_label = ttk.Label(
             self,
@@ -549,16 +540,6 @@ class AudioPlayer(ttk.Frame):
             anchor="center",
         )
         self.status_label.pack(pady=(5, 0))
-        
-        # Skip info label
-        self.skip_info_label = ttk.Label(
-            self,
-            text="Can't listen? Skip this exercise →",
-            font=("Helvetica", 10),
-            foreground="#888888",
-            anchor="center",
-        )
-        self.skip_info_label.pack(pady=(2, 0))
         
         # Loading indicator
         self.loading_label = ttk.Label(
@@ -573,26 +554,17 @@ class AudioPlayer(ttk.Frame):
         # Initially show loading, hide controls
         self._show_loading()
     
-    def _on_skip_click(self) -> None:
-        """Handle skip button click."""
-        logger.ui("User skipped audio exercise")
-        self.stop()
-        if self._on_skip:
-            self._on_skip()
-    
     def _show_loading(self) -> None:
         """Show loading state."""
         self.loading_label.pack(pady=10)
         self.control_frame.pack_forget()
         self.status_label.pack_forget()
-        self.skip_info_label.pack_forget()
     
     def _show_controls(self) -> None:
         """Show playback controls."""
         self.loading_label.pack_forget()
         self.control_frame.pack(pady=10)
         self.status_label.pack(pady=(5, 0))
-        self.skip_info_label.pack(pady=(2, 0))
     
     def set_audio(self, audio_path: str) -> bool:
         """
@@ -739,24 +711,12 @@ class SpeechRecorder(ttk.Frame):
         self.button_frame = ttk.Frame(self)
         self.button_frame.pack(pady=10)
         
-        # Record button - use tk.Button for better event handling
-        # Using click-to-toggle instead of hold-to-record for reliability
-        self.record_button = tk.Button(
+        # Record button - using ttk.Button for consistent styling
+        self.record_button = ttk.Button(
             self.button_frame,
             text="🎤 Click to Start Recording",
-            font=("Helvetica", 13, "bold"),
-            bg="#1a1a1a",  # Very dark gray background
-            fg="#e0e0e0",  # Light gray text for contrast
-            activebackground="#5a9bd4",  # Light blue when pressed
-            activeforeground="#000000",  # Black text when pressed
-            highlightbackground="#1a1a1a",
-            highlightcolor="#5a9bd4",
-            relief="raised",
-            borderwidth=3,
-            padx=20,
-            pady=10,
-            cursor="hand2",
             command=self._toggle_recording,
+            width=25,
         )
         self.record_button.pack(side="left", padx=5)
         
@@ -834,11 +794,7 @@ class SpeechRecorder(ttk.Frame):
         self.prompt_label.configure(text=f'"{prompt_text}"')
         self.transcription_label.pack_forget()
         self.status_label.configure(text="Click the button to start recording", foreground="#7bb3ff")
-        self.record_button.configure(
-            text="🎤 Click to Start Recording",
-            bg="#1a1a1a",  # Very dark gray
-            fg="#e0e0e0",  # Light text
-        )
+        self.record_button.configure(text="🎤 Click to Start Recording")
     
     def _start_recording(self) -> None:
         """Start recording audio."""
@@ -848,10 +804,7 @@ class SpeechRecorder(ttk.Frame):
         logger.ui("Starting speech recording...")
         self._is_recording = True
         self._recording_data = []
-        self.record_button.configure(
-            text="🔴 Click to Stop Recording",
-            bg="#8B0000",  # Dark red background
-        )
+        self.record_button.configure(text="🔴 Recording... Click to Stop")
         self.status_label.configure(text="Recording... Click button when done", foreground="#ff6b6b")
         
         # Start recording in a thread
@@ -884,11 +837,7 @@ class SpeechRecorder(ttk.Frame):
         
         logger.ui("Stopping speech recording...")
         self._is_recording = False
-        self.record_button.configure(
-            text="🎤 Click to Start Recording",
-            bg="#1a1a1a",  # Very dark gray
-            fg="#e0e0e0",  # Light text
-        )
+        self.record_button.configure(text="🎤 Click to Start Recording")
         self.status_label.configure(text="Processing...", foreground="#7bb3ff")
         
         # Save recording in a thread
@@ -938,11 +887,7 @@ class SpeechRecorder(ttk.Frame):
             text="No audio recorded. Click the button and speak clearly.", 
             foreground="#ff6b6b"
         )
-        self.record_button.configure(
-            text="🎤 Click to Start Recording",
-            bg="#1a1a1a",
-            fg="#e0e0e0",
-        )
+        self.record_button.configure(text="🎤 Click to Start Recording")
     
     def show_transcription(self, text: str) -> None:
         """Show the transcription result."""
@@ -965,11 +910,7 @@ class SpeechRecorder(ttk.Frame):
         self._recording_path = None
         self.transcription_label.pack_forget()
         self.status_label.configure(text="Click the button to start recording", foreground="#7bb3ff")
-        self.record_button.configure(
-            text="🎤 Click to Start Recording",
-            bg="#1a1a1a",
-            fg="#e0e0e0",
-        )
+        self.record_button.configure(text="🎤 Click to Start Recording")
 
 
 # ---------------------------------------------------------------------------
@@ -1220,15 +1161,10 @@ class LanguageBuddyApp(tk.Tk):
         lang_profile.total_cards_completed += self.current_session.cards_completed
         lang_profile.total_vocabulary_learned = len(db.get_all_vocabulary(language))
         lang_profile.total_time_minutes += self.current_session.duration_minutes
-        
-        # Update streak
         lang_profile.last_practice_date = datetime.now(timezone.utc).isoformat()
-        # Simple streak logic - would need more sophistication for real tracking
-        lang_profile.current_streak_days = min(lang_profile.current_streak_days + 1, 365)
-        lang_profile.longest_streak_days = max(
-            lang_profile.longest_streak_days, 
-            lang_profile.current_streak_days
-        )
+        
+        # Note: Streaks are calculated from session timestamps, not stored values
+        # The _update_streak method in database.py handles this after save_session()
         
         db.update_language_profile(lang_profile)
         logger.success(f"Language profile updated: {lang_profile.overall_proficiency}")
@@ -1777,14 +1713,17 @@ class LanguageBuddyApp(tk.Tk):
         
         profile = db.get_language_profile(language) if db.is_connected() else None
         
+        # Calculate streak from session timestamps (authoritative)
+        current_streak, _ = db.calculate_streaks(language) if db.is_connected() else (0, 0)
+        
         self.session_stats = SessionStats(
             words_learned_before=profile.total_vocabulary_learned if profile else 0,
             fluency_before=profile.fluency_score if profile else 0,
             proficiency_before=profile.overall_proficiency if profile else "A1",
-            streak_before=profile.current_streak_days if profile else 0,
+            streak_before=current_streak,
         )
         logger.debug(f"Initial stats captured: {self.session_stats.words_learned_before} words, "
-                    f"fluency={self.session_stats.fluency_before}")
+                    f"fluency={self.session_stats.fluency_before}, streak={current_streak}")
     
     def proceed_to_lessons(self) -> None:
         """Called from AssessmentResultsCard to proceed to teaching phase."""
@@ -1953,19 +1892,48 @@ class LanguageBuddyApp(tk.Tk):
             def generate_summary():
                 logger.task_start("generate_summary")
                 try:
-                    total_score = sum(card.card_score for card in self.lesson_plan.cards)
-                    average_score = total_score // len(self.lesson_plan.cards) if self.lesson_plan.cards else 0
+                    # Calculate scores excluding skipped cards (STT/TTS exercises)
+                    scored_cards = [card for card in self.lesson_plan.cards if not card.skipped]
+                    total_score = sum(card.card_score for card in scored_cards)
+                    average_score = total_score // len(scored_cards) if scored_cards else 0
                     self.lesson_plan.total_score = average_score
-                    logger.debug(f"Calculated scores: total={total_score}, average={average_score}")
+                    skipped_count = len(self.lesson_plan.cards) - len(scored_cards)
+                    logger.debug(f"Calculated scores: total={total_score}, average={average_score}, skipped={skipped_count}")
+                    
+                    # Re-evaluate proficiency based on quiz performance AND full learning history
+                    # This is a HOLISTIC evaluation - considers vocab retention, session history, grammar mastery
+                    logger.ui("Evaluating quiz performance with full learning history...")
+                    self.after(0, lambda: summary_card.show_loading("Evaluating your performance..."))
+                    
+                    # Get full learner context for holistic evaluation
+                    from core.database import get_db
+                    db = get_db()
+                    learner_history = None
+                    if db.is_connected():
+                        learner_history = db.generate_llm_context_string(self.selected_language or "Spanish")
+                        logger.debug(f"Loaded {len(learner_history)} chars of learning history for evaluation")
+                    
+                    updated_assessment = evaluate_quiz_performance(
+                        self.lesson_plan,
+                        self.assessment_result or AssessmentResult(),
+                        self.selected_language or "Spanish",
+                        learner_context=learner_history,
+                    )
+                    
+                    # Update the assessment result with new proficiency/fluency
+                    self.assessment_result = updated_assessment
+                    logger.success(f"Proficiency updated: {updated_assessment.proficiency} ({updated_assessment.fluency_score}/100)")
+                    
+                    self.after(0, lambda: summary_card.show_loading("Generating summary..."))
                     
                     summary = generate_final_summary(
                         self.lesson_plan,
-                        self.assessment_result or AssessmentResult(),
+                        self.assessment_result,
                         self.selected_language or "Spanish"
                     )
                     self.final_summary = summary
                     
-                    # Save session to database
+                    # Save session to database (with updated proficiency)
                     self._save_session_to_database()
                     
                     logger.task_complete("generate_summary")
@@ -2037,25 +2005,19 @@ class IntroCard(ttk.Frame):
         title.grid(row=0, column=0, pady=(40, 20), padx=20)
 
         desc_text = (
-            "Welcome! This AI-powered tool helps you learn languages with personalized lessons.\n\n"
-            "How it works:\n"
-            "  1. Choose a language — you can learn multiple simultaneously!\n"
-            "  2. New learners take a comprehensive assessment (10-12 questions)\n"
-            "     to determine your starting proficiency level.\n"
-            "  3. 📚 Learning Phase — Study new vocabulary, grammar, and phrases\n"
-            "     with images, audio pronunciation, and conjugation tables.\n"
-            "  4. 📝 Quiz Phase — Test what you learned with multiple choice,\n"
-            "     fill-in-the-blank, listening, and speaking exercises.\n"
-            "  5. 📊 Get feedback and track your progress over time.\n\n"
-            "Returning learners skip the assessment and jump straight into learning!\n"
-            "Your vocabulary, progress, and streaks are saved automatically."
+            "🌍  Pick a language to learn\n"
+            "📋  Quick assessment (first time only)\n"
+            "📚  Learn new words & grammar\n"
+            "📝  Quiz to test your knowledge\n"
+            "📊  Track your progress & streaks\n\n"
+            "Your progress saves automatically!"
         )
         desc = ttk.Label(
             self.content, 
             text=desc_text, 
             wraplength=650, 
-            justify="center",
-            anchor="center",
+            justify="left",  # Left-align the numbered list
+            anchor="w",      # Anchor text to the west (left)
             font=("Helvetica", 14),
             foreground="#d0d0d0",  # Light gray text on dark background
         )
@@ -2266,9 +2228,11 @@ class IntroCard(ttk.Frame):
                 text=f"📖 {profile.total_vocabulary_learned} words learned  •  🎯 {profile.total_cards_completed} cards completed"
             )
             
-            if profile.current_streak_days > 0:
+            # Calculate streaks from actual session timestamps (authoritative)
+            current_streak, longest_streak = db.calculate_streaks(language)
+            if current_streak > 0:
                 self.selected_streak_label.configure(
-                    text=f"🔥 {profile.current_streak_days} day streak (best: {profile.longest_streak_days})"
+                    text=f"🔥 {current_streak} day streak (best: {longest_streak})"
                 )
                 self.selected_streak_label.grid()
             else:
@@ -3883,10 +3847,7 @@ class LessonCardView(ttk.Frame):
         
         # Create or update audio player - place it in content frame (row 3, where image normally goes)
         if not self.audio_player:
-            self.audio_player = AudioPlayer(
-                self.content,
-                on_skip=self._on_skip_audio
-            )
+            self.audio_player = AudioPlayer(self.content)
         
         # Place audio player in the content area (between progress label and question)
         self.audio_player.grid(row=3, column=0, pady=(10, 10))
@@ -3994,11 +3955,12 @@ class LessonCardView(ttk.Frame):
         
         card = plan.cards[self.controller.lesson_index]
         
-        # Mark as skipped with partial credit
-        card.is_correct = False
-        card.card_score = 0
-        card.user_response = "[SKIPPED - Audio exercise]"
-        card.feedback = "Exercise skipped. Audio exercises help develop listening skills - try them when you can!"
+        # Mark as skipped - NOT penalized (excluded from scoring)
+        card.skipped = True
+        card.is_correct = None  # Not evaluated
+        card.card_score = 0     # Will be excluded from average
+        card.user_response = "[SKIPPED]"
+        card.feedback = "No problem! Audio exercises are optional. Try them when you can listen."
         
         # Show brief feedback then move to next card
         self._show_skip_feedback("Audio exercise skipped", card)
@@ -4013,22 +3975,23 @@ class LessonCardView(ttk.Frame):
         
         card = plan.cards[self.controller.lesson_index]
         
-        # Mark as skipped with partial credit
-        card.is_correct = False
-        card.card_score = 0
-        card.user_response = "[SKIPPED - Speaking exercise]"
-        card.feedback = "Exercise skipped. Speaking practice helps with pronunciation - try it when you can!"
+        # Mark as skipped - NOT penalized (excluded from scoring)
+        card.skipped = True
+        card.is_correct = None  # Not evaluated
+        card.card_score = 0     # Will be excluded from average
+        card.user_response = "[SKIPPED]"
+        card.feedback = "No problem! Speaking exercises are optional. Try them when you can record."
         
         # Show brief feedback then move to next card
         self._show_skip_feedback("Speaking exercise skipped", card)
     
     def _show_skip_feedback(self, message: str, card: LessonCard) -> None:
         """Show brief feedback for skipped exercises and move to next card."""
-        # Create a simple feedback display
+        # Create a simple feedback display - skipped cards are not penalized
         feedback_data = {
-            "is_correct": False,
+            "is_correct": None,  # Not evaluated
             "card_score": 0,
-            "feedback": card.feedback,
+            "feedback": card.feedback + "\n\n(This exercise was not counted in your score.)",
             "correct_answer": card.correct_answer or card.speaking_prompt or "",
             "alternatives": [],
             "vocabulary_expansion": card.vocabulary_expansion or [],

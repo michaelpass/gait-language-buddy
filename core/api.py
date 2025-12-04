@@ -2033,22 +2033,69 @@ def generate_teaching_batch(
         return []
     
     try:
-        # Simpler, focused prompt for faster generation
+        # Focused prompt with diversity in language components
         type_instructions = {
-            "vocabulary": f"""Generate {num_cards} NEW vocabulary cards. Include a MIX of nouns and VERBS.
+            "vocabulary": f"""Generate {num_cards} NEW vocabulary cards with DIVERSE language components.
 
-For VERBS: After each verb card, include a "conjugation_table" card showing:
-- All present tense conjugations (ich, du, er/sie/es, wir, ihr, sie/Sie for German, etc.)
+REQUIRED DIVERSITY - Include a mix of:
+• NOUNS (with articles/gender where applicable) - common objects, places, people, concepts
+• VERBS (action words) - everyday actions, modal verbs, reflexive verbs
+• ADJECTIVES - descriptive words, colors, sizes, emotions
+• ADVERBS - manner, time, place, frequency
+• PREPOSITIONS - spatial relationships, time expressions
+• PRONOUNS - personal, possessive, demonstrative
+• CONJUNCTIONS - connecting words
+• NUMBERS/QUANTIFIERS - if beginner level
+• COMMON PHRASES - greetings, expressions, idioms (at appropriate level)
+
+For {language}, also consider language-specific elements like:
+- Articles and gender (German: der/die/das, French: le/la, Spanish: el/la)
+- Cases (German: nominative, accusative, dative, genitive)
+- Verb aspects (Russian, Polish: perfective/imperfective)
+- Honorifics (Japanese, Korean)
+- Tones (Chinese, Vietnamese)
+
+MANDATORY FOR ALL VERBS:
+Every verb card (part_of_speech: "verb") MUST be IMMEDIATELY followed by a "conjugation_table" card showing:
+- The infinitive form
+- Present tense conjugations for all persons
 - 2-3 example sentences using different conjugations
 
-This means if you include 2 verbs, you'll have 2 verb cards + 2 conjugation cards.""",
-            "grammar": f"Generate {num_cards} grammar lesson cards explaining key {proficiency} level grammar concepts.",
-            "review": f"Generate {num_cards} REVIEW cards for common {proficiency} level vocabulary.",
+NEVER show a verb without its conjugation table immediately after.""",
+            "grammar": f"""Generate {num_cards} grammar lesson cards for {proficiency} level {language}.
+
+Cover DIVERSE grammar topics appropriate for this level:
+• Sentence structure and word order
+• Verb tenses and moods (present, past, future, subjunctive, etc.)
+• Noun declensions and cases (if applicable)
+• Agreement rules (gender, number, case)
+• Pronouns and their usage
+• Prepositions and their cases
+• Articles (definite, indefinite, partitive)
+• Adjective placement and agreement
+• Question formation
+• Negation
+• Comparison (comparative, superlative)
+• Relative clauses
+• Reported speech
+
+Pick topics most important for {proficiency} level.""",
+            "review": f"""Generate {num_cards} REVIEW cards for vocabulary the learner needs to practice.
+
+Include a DIVERSE mix of word types: nouns, verbs, adjectives, adverbs, etc.
+
+MANDATORY: If reviewing a VERB, ALWAYS include a conjugation_table card immediately after it.""",
         }
         
         avoid_words = ""
         if existing_words:
-            avoid_words = f"\n\nDO NOT include these words (already generated): {', '.join(existing_words[:20])}"
+            # Show all existing words to avoid duplicates across batches AND previous sessions
+            avoid_words = f"""
+
+⚠️ CRITICAL - FORBIDDEN WORDS ({len(existing_words)} words) - DO NOT USE ANY OF THESE:
+{', '.join(existing_words)}
+
+These words are either already known by the learner or already in this lesson. Generate DIFFERENT words."""
         
         conjugation_schema = """
 For VERB cards (part_of_speech: "verb"), ALWAYS follow with a conjugation_table card:
@@ -2076,14 +2123,31 @@ For VERB cards (part_of_speech: "verb"), ALWAYS follow with a conjugation_table 
 }
 """
         
+        # Build learner context section
+        learner_section = ""
+        if learner_context:
+            learner_section = f"""
+{learner_context}
+
+⚠️ STRICT RULES:
+1. NEVER generate any word listed under "WORDS ALREADY KNOWN" - these are FORBIDDEN
+2. For REVIEW cards: Use words from "WORDS NEEDING PRACTICE" 
+3. Match their current proficiency level
+4. If you can't think of new words, use different word categories (colors, emotions, food, etc.)
+"""
+        
+        # Include conjugation schema for vocabulary and review batches (both can have verbs)
+        include_conjugation = batch_type in ("vocabulary", "review")
+        
         system_prompt = f"""Generate teaching cards for {proficiency} level {language} learners.
 {type_instructions.get(batch_type, type_instructions["vocabulary"])}
 {avoid_words}
-
-{conjugation_schema if batch_type == "vocabulary" else ""}
+{learner_section}
+{conjugation_schema if include_conjugation else ""}
 
 Return ONLY JSON: {{"cards": [...]}}
 Each card needs: type, title, word, translation, explanation, example_sentence, example_translation, image_prompt, audio_text, is_new, is_review, difficulty_level, part_of_speech.
+For conjugation_table cards: infinitive, translation, tense, verb_type, conjugations (dict), conjugation_examples (list).
 {f'Theme: {theme}' if theme else ''}"""
 
         messages = [
@@ -2327,7 +2391,28 @@ def _generate_teaching_content_batched(
     logger.api("Using batched generation for progressive loading")
     
     all_cards: List[TeachingCard] = []
+    
+    # Pre-populate with known words from learner context to avoid duplicates
     generated_words: List[str] = []
+    if learner_context:
+        # Extract known words from learner context string
+        # Look for the "WORDS ALREADY KNOWN" section
+        if "WORDS ALREADY KNOWN" in learner_context:
+            try:
+                # Find the line with the words
+                lines = learner_context.split('\n')
+                for i, line in enumerate(lines):
+                    if "WORDS ALREADY KNOWN" in line:
+                        # Next line(s) contain the words
+                        if i + 1 < len(lines):
+                            words_line = lines[i + 1].strip()
+                            if words_line:
+                                known_words = [w.strip() for w in words_line.split(',') if w.strip()]
+                                generated_words.extend(known_words)
+                                logger.debug(f"Pre-loaded {len(known_words)} known words to avoid duplicates")
+                        break
+            except Exception as e:
+                logger.warning(f"Could not parse known words from context: {e}")
     
     # Calculate batches: vocab(6), vocab(6), grammar(3), review(5)
     batches = [
@@ -2342,8 +2427,10 @@ def _generate_teaching_content_batched(
     
     discovered_theme = theme or "Daily Life"
     
+    logger.debug(f"Starting batch generation with {len(generated_words)} forbidden words")
+    
     for batch_num, (batch_type, num_cards) in enumerate(batches, 1):
-        logger.api(f"Generating batch {batch_num}/{total_batches}: {batch_type} ({num_cards} cards)")
+        logger.api(f"Generating batch {batch_num}/{total_batches}: {batch_type} ({num_cards} cards), avoiding {len(generated_words)} words")
         
         cards = generate_teaching_batch(
             language=language,
@@ -2351,14 +2438,17 @@ def _generate_teaching_content_batched(
             batch_type=batch_type,
             num_cards=num_cards,
             theme=discovered_theme,
-            learner_context=learner_context if batch_type == "review" else None,
+            learner_context=learner_context,  # Always pass learner context to avoid duplicates
             existing_words=generated_words,
         )
         
-        # Track words to avoid duplicates
+        # Track words to avoid duplicates (including verb infinitives)
         for card in cards:
             if card.word:
                 generated_words.append(card.word)
+            # Also track infinitives from conjugation tables
+            if card.infinitive and card.infinitive not in generated_words:
+                generated_words.append(card.infinitive)
         
         all_cards.extend(cards)
         
@@ -2785,6 +2875,188 @@ def _evaluate_card_response_fallback(
         "alternatives": card.alternatives or [],
         "vocabulary_expansion": card.vocabulary_expansion or [],
     }
+
+
+def evaluate_quiz_performance(
+    lesson_plan: LessonPlan,
+    current_assessment: AssessmentResult,
+    language: str,
+    learner_context: Optional[str] = None,
+) -> AssessmentResult:
+    """
+    Re-evaluate proficiency based on quiz performance AND full learning history.
+    
+    This performs a HOLISTIC evaluation considering:
+    - Current quiz performance
+    - All vocabulary learned and their strength ratings
+    - Historical session performance
+    - Grammar patterns mastered
+    - Overall learning trajectory
+    
+    Proficiency can go UP or DOWN based on this comprehensive assessment.
+    
+    Args:
+        lesson_plan: The completed quiz with scored cards
+        current_assessment: The user's current assessment result
+        language: Target language
+        learner_context: Full learning history from database (vocabulary, sessions, etc.)
+        
+    Returns:
+        Updated AssessmentResult with new fluency_score and potentially new proficiency
+    """
+    logger.separator("Evaluating Quiz Performance (Holistic)")
+    logger.api(f"evaluate_quiz_performance() for {language}")
+    
+    if client is None or not lesson_plan.cards:
+        logger.warning("No API or no cards - returning current assessment unchanged")
+        return current_assessment
+    
+    try:
+        # Collect quiz performance data (excluding skipped cards - STT/TTS exercises)
+        cards_data = []
+        skipped_count = 0
+        for card in lesson_plan.cards:
+            if card.skipped:
+                skipped_count += 1
+                continue  # Don't include skipped cards in evaluation
+            cards_data.append({
+                "question": card.question[:100] if card.question else "",
+                "type": card.type,
+                "difficulty": card.difficulty_level,
+                "is_correct": card.is_correct,
+                "score": card.card_score,
+                "user_response": card.user_response[:100] if card.user_response else "",
+            })
+        
+        if skipped_count > 0:
+            logger.debug(f"Excluded {skipped_count} skipped cards from evaluation")
+        
+        # Calculate stats excluding skipped cards
+        scored_cards = [c for c in lesson_plan.cards if not c.skipped]
+        correct_count = sum(1 for c in scored_cards if c.is_correct)
+        total_count = len(scored_cards)
+        quiz_percentage = (correct_count / total_count * 100) if total_count > 0 else 0
+        
+        logger.debug(f"Quiz results: {correct_count}/{total_count} correct ({quiz_percentage:.1f}%), {skipped_count} skipped")
+        if learner_context:
+            logger.debug(f"Learner context: {len(learner_context)} chars of history data")
+        
+        # Build learner history section for holistic evaluation
+        history_section = ""
+        if learner_context:
+            history_section = f"""
+=== COMPLETE LEARNING HISTORY ===
+{learner_context}
+=== END LEARNING HISTORY ===
+
+Use the learning history above to make a HOLISTIC assessment. Consider:
+- How many words they've learned and their retention (strength ratings)
+- Their performance trend across multiple sessions
+- Which grammar patterns they've mastered vs struggling with
+- Their overall learning trajectory (improving, plateauing, declining?)
+"""
+        
+        system_prompt = f"""You are evaluating a {language} learner's proficiency based on their COMPLETE learning history and current quiz performance.
+
+This is a HOLISTIC evaluation - consider ALL available data, not just the current quiz.
+
+CURRENT PROFICIENCY:
+- Overall Level: {current_assessment.proficiency}
+- Vocabulary: {current_assessment.vocabulary_level}
+- Grammar: {current_assessment.grammar_level}
+- Fluency Score: {current_assessment.fluency_score}/100
+
+TODAY'S QUIZ RESULTS:
+- Questions: {total_count}
+- Correct: {correct_count} ({quiz_percentage:.1f}%)
+{history_section}
+
+HOLISTIC SCORING GUIDELINES:
+
+1. FLUENCY SCORE (0-100) - Based on overall competence:
+   - Consider vocabulary breadth AND retention (mastered vs weak words)
+   - Consider consistency across sessions (not just this quiz)
+   - Consider grammar pattern mastery
+   - Adjust by -15 to +15 based on trajectory:
+     * Consistently improving with good retention: +10 to +15
+     * Good quiz, stable performance: +5 to +10
+     * Average performance: -5 to +5
+     * Declining performance or poor retention: -10 to -5
+     * Significantly struggling: -15 to -10
+
+2. PROFICIENCY LEVEL (A1 → A2 → B1 → B2 → C1 → C2):
+   - Upgrade if: Mastered 80%+ of current level vocabulary, strong grammar, consistent good performance
+   - Downgrade if: Struggling with current level content across multiple sessions, poor retention
+   - Look at the TREND, not just one quiz
+   - A1→A2: Basic survival phrases + simple present tense mastered
+   - A2→B1: Can discuss routine matters, past/future tenses, 1000+ words
+   - B1→B2: Can discuss abstract topics, conditional, 2500+ words
+   - B2→C1: Nuanced expression, complex grammar, 5000+ words
+   - C1→C2: Near-native fluency, idioms, rare vocabulary
+
+3. VOCABULARY vs GRAMMAR assessment:
+   - If vocabulary strong but grammar weak: Higher vocab level, lower grammar level
+   - These should be assessed INDEPENDENTLY based on the evidence
+
+Return ONLY a JSON object:
+{{
+    "proficiency": "A1" or "A2" or "B1" or "B2" or "C1" or "C2",
+    "vocabulary_level": "A1" to "C2",
+    "grammar_level": "A1" to "C2",
+    "fluency_score": 0-100 (holistically adjusted),
+    "strengths": ["Updated strength 1", "Updated strength 2", "Updated strength 3"],
+    "weaknesses": ["Updated weakness 1", "Updated weakness 2"],
+    "recommendations": ["Specific recommendation 1", "Specific recommendation 2"],
+    "performance_summary": "Brief explanation of the holistic assessment and trajectory"
+}}"""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Today's quiz card details:\n{json.dumps(cards_data, indent=2)}"},
+        ]
+        
+        logger.api_call("chat.completions.create (quiz_evaluation)", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.3,
+                max_tokens=1000,
+            )
+        logger.api_response("quiz_evaluation", duration_ms=timer.duration_ms)
+        
+        raw = completion.choices[0].message.content
+        data = json.loads(raw)
+        
+        # Log the changes
+        old_fluency = current_assessment.fluency_score
+        new_fluency = data.get("fluency_score", old_fluency)
+        old_prof = current_assessment.proficiency
+        new_prof = data.get("proficiency", old_prof)
+        
+        logger.debug(f"Fluency: {old_fluency} → {new_fluency} (delta: {new_fluency - old_fluency:+d})")
+        logger.debug(f"Proficiency: {old_prof} → {new_prof}")
+        if data.get("performance_summary"):
+            logger.debug(f"Summary: {data['performance_summary'][:100]}...")
+        
+        # Create updated assessment result
+        updated_result = AssessmentResult(
+            proficiency=data.get("proficiency", current_assessment.proficiency),
+            vocabulary_level=data.get("vocabulary_level", current_assessment.vocabulary_level),
+            grammar_level=data.get("grammar_level", current_assessment.grammar_level),
+            fluency_score=data.get("fluency_score", current_assessment.fluency_score),
+            strengths=data.get("strengths", current_assessment.strengths),
+            weaknesses=data.get("weaknesses", current_assessment.weaknesses),
+            recommendations=data.get("recommendations", current_assessment.recommendations),
+        )
+        
+        logger.success(f"Quiz evaluation complete: {new_prof} ({new_fluency}/100)")
+        return updated_result
+        
+    except Exception as e:
+        logger.api_error(f"Quiz evaluation failed: {e}")
+        return current_assessment
 
 
 def generate_final_summary(

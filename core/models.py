@@ -78,6 +78,7 @@ class LessonCard:
     user_answer_index: Optional[int] = None
     is_correct: Optional[bool] = None
     card_score: int = 0                     # Score for this specific card (0-100)
+    skipped: bool = False                   # True if user skipped this card (not penalized)
 
 
 @dataclass

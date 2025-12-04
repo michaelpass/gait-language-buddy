@@ -632,9 +632,9 @@ class DatabaseClient:
         self,
         language: str,
         user_id: Optional[str] = None,
-        limit: int = 500
+        limit: Optional[int] = None
     ) -> List[VocabularyItem]:
-        """Get all vocabulary for a language."""
+        """Get all vocabulary for a language. If limit is None, returns ALL words."""
         uid = user_id or self._user_id
         
         if not self.is_connected():
@@ -647,11 +647,15 @@ class DatabaseClient:
             return items
         
         try:
-            docs = self.db.collection("users").document(uid)\
+            query = self.db.collection("users").document(uid)\
                          .collection("vocabulary")\
-                         .where("language", "==", language)\
-                         .limit(limit).stream()
+                         .where("language", "==", language)
             
+            # Only apply limit if specified
+            if limit is not None:
+                query = query.limit(limit)
+            
+            docs = query.stream()
             return [VocabularyItem.from_dict(doc.to_dict()) for doc in docs]
             
         except Exception as e:
@@ -843,10 +847,11 @@ class DatabaseClient:
             profile = self.get_language_profile(language, uid)
             if profile:
                 profile.current_streak_days = current_streak
-                profile.longest_streak_days = max(profile.longest_streak_days, longest_streak)
+                # Use the calculated longest_streak directly from session data (authoritative)
+                profile.longest_streak_days = longest_streak
                 profile.last_practice_date = datetime.now(timezone.utc).date().isoformat()
                 self.update_language_profile(profile, uid)
-                logger.debug(f"[DB] Streak updated: current={current_streak}, longest={profile.longest_streak_days}")
+                logger.debug(f"[DB] Streak updated: current={current_streak}, longest={longest_streak}")
         except Exception as e:
             logger.error(f"Error updating streak: {e}")
     
@@ -920,6 +925,28 @@ class DatabaseClient:
         
         return current_streak, longest_streak
     
+    def calculate_streaks(
+        self,
+        language: str,
+        user_id: Optional[str] = None,
+    ) -> tuple:
+        """
+        Calculate current and longest streaks from session timestamps.
+        
+        This is the authoritative method - calculates from actual session data,
+        not stored values.
+        
+        Args:
+            language: The language to calculate streaks for
+            user_id: Optional user ID (defaults to current user)
+            
+        Returns:
+            Tuple of (current_streak, longest_streak)
+        """
+        # Get ALL sessions, not just recent ones
+        sessions = self.get_recent_sessions(language, user_id, limit=1000)
+        return self._calculate_streak_from_sessions(sessions)
+    
     def get_recent_sessions(
         self,
         language: str,
@@ -960,7 +987,6 @@ class DatabaseClient:
         self,
         language: str,
         user_id: Optional[str] = None,
-        max_vocab: int = 100,
         max_sessions: int = 5
     ) -> Dict[str, Any]:
         """
@@ -973,10 +999,12 @@ class DatabaseClient:
         user = self.get_or_create_user(uid)
         lang_profile = self.get_language_profile(language, uid)
         
-        # Get vocabulary
-        all_vocab = self.get_all_vocabulary(language, uid, limit=max_vocab)
-        weak_vocab = self.get_weak_vocabulary(language, uid, limit=20)
-        strong_vocab = [v for v in all_vocab if v.strength_score >= 80][:20]
+        # Get ALL vocabulary - no limit, track every word the user has learned
+        all_vocab = self.get_all_vocabulary(language, uid, limit=None)  # No limit
+        weak_vocab = self.get_weak_vocabulary(language, uid, limit=30)
+        
+        # ALL known words (for avoiding duplicates in new lessons)
+        all_known_words = [v.word for v in all_vocab if v.word]
         
         # Vocabulary summary
         vocab_summary = {
@@ -988,7 +1016,7 @@ class DatabaseClient:
                 {"word": v.word, "translation": v.translation, "strength": v.strength_score}
                 for v in weak_vocab[:10]
             ],
-            "strong_words": [v.word for v in strong_vocab[:15]],
+            "all_known_words": all_known_words,  # ALL words learned (for avoiding duplicates)
         }
         
         # Recent sessions summary
@@ -1067,16 +1095,39 @@ class DatabaseClient:
             f"  - Strong: {context['vocabulary']['strong_count']}",
             f"  - Learning: {context['vocabulary']['learning_count']}",
             "",
-            "WORDS NEEDING PRACTICE:",
+            "WORDS NEEDING PRACTICE (prioritize these in review):",
         ])
-        for v in context['vocabulary']['weak_words_needing_practice'][:5]:
+        for v in context['vocabulary']['weak_words_needing_practice'][:10]:
             lines.append(f"  - {v['word']} ({v['translation']}) - strength: {v['strength']}/100")
+        
+        # Add ALL known words to AVOID for new vocabulary
+        all_known_words = context['vocabulary'].get('all_known_words', [])
+        if all_known_words:
+            lines.extend([
+                "",
+                f"WORDS ALREADY KNOWN - DO NOT TEACH THESE ({len(all_known_words)} words):",
+                f"  {', '.join(all_known_words)}"  # Include ALL known words
+            ])
         
         lines.extend([
             "",
             f"SESSIONS: {context['sessions']['total_sessions']} total",
             f"Current Streak: {context['sessions']['current_streak']} days",
         ])
+        
+        # Add recent session performance for holistic evaluation
+        recent_sessions = context['sessions'].get('recent_sessions', [])
+        if recent_sessions:
+            lines.extend([
+                "",
+                "RECENT SESSION PERFORMANCE (newest first):",
+            ])
+            for i, session in enumerate(recent_sessions[:5], 1):
+                accuracy = session.get('accuracy', 0) * 100
+                cards = session.get('cards_completed', 0)
+                new_vocab = session.get('new_vocabulary', 0)
+                date = session.get('date', 'Unknown')[:10]  # Just the date part
+                lines.append(f"  {i}. {date}: {accuracy:.0f}% accuracy, {cards} cards, +{new_vocab} words")
         
         if context['learning_goals']:
             lines.extend([
@@ -1089,6 +1140,26 @@ class DatabaseClient:
         lines.append("=== END PROFILE ===")
         
         return "\n".join(lines)
+    
+    def get_all_known_words(
+        self,
+        language: str,
+        user_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[str]:
+        """
+        Get a simple list of all words the user has learned in a language.
+        Useful for preventing duplicate vocabulary in lesson generation.
+        
+        Returns:
+            List of word strings (in the target language)
+        """
+        if not self._connected:
+            return []
+        
+        uid = user_id or self._user_id
+        all_vocab = self.get_all_vocabulary(language, uid, limit=limit)
+        return [v.word for v in all_vocab if v.word]
 
 
 # ---------------------------------------------------------------------------
