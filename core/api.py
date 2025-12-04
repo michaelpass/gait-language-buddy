@@ -2582,24 +2582,32 @@ CARD 2: IMMEDIATELY AFTER, a conjugation_table
 FAILURE TO INCLUDE CONJUGATION TABLE = REJECTED CARD
 Every single verb MUST have its conjugation table. No exceptions.
 🚨🚨🚨 END VERB REQUIREMENT 🚨🚨🚨""",
-            "grammar": f"""Generate {num_cards} grammar lesson cards for {proficiency} level {language}.
+            "grammar": f"""Generate {num_cards} NEW grammar lesson cards for {proficiency} level {language}.
 
-Cover DIVERSE grammar topics appropriate for this level:
+⚠️ Check the LEARNER PROFILE below for "GRAMMAR CONCEPTS ALREADY TAUGHT" section.
+⚠️ Do NOT repeat any grammar concepts that have already been taught!
+⚠️ Generate DIFFERENT, NEW grammar topics.
+
+Grammar topics to choose from (pick ones NOT already taught):
 • Sentence structure and word order
-• Verb tenses and moods (present, past, future, subjunctive, etc.)
-• Noun declensions and cases (if applicable)
+• Verb tenses and moods (present, past, future, subjunctive, conditional, imperative)
+• Noun declensions and cases (nominative, accusative, dative, genitive)
 • Agreement rules (gender, number, case)
-• Pronouns and their usage
+• Pronouns (personal, possessive, reflexive, demonstrative, relative)
 • Prepositions and their cases
-• Articles (definite, indefinite, partitive)
-• Adjective placement and agreement
-• Question formation
-• Negation
-• Comparison (comparative, superlative)
+• Articles (definite, indefinite, partitive, zero article)
+• Adjective placement, agreement, and comparison
+• Adverb formation and placement
+• Question formation (yes/no, wh-questions, tag questions)
+• Negation patterns
+• Modal verbs and their usage
+• Passive voice
 • Relative clauses
-• Reported speech
+• Reported/indirect speech
+• Conjunctions (coordinating, subordinating)
+• Time expressions
 
-Pick topics most important for {proficiency} level.""",
+Pick {num_cards} NEW topics appropriate for {proficiency} level that have NOT been taught before.""",
             "review": f"""Generate {num_cards} REVIEW cards for vocabulary the learner needs to practice.
 
 Include a DIVERSE mix of word types: nouns, verbs, adjectives, adverbs, etc.
@@ -2617,21 +2625,26 @@ EVERY verb in review MUST have a conjugation_table immediately following it.""",
         }
         
         avoid_words = ""
+        banned_words_list = ""
         if existing_words:
-            # Show all existing words to avoid duplicates across batches AND previous sessions
-            display_words = existing_words[:150]  # Show more words for better context
+            # Show ALL existing words - no truncation
+            banned_words_list = ', '.join(existing_words)
             avoid_words = f"""
 
-🚫🚫🚫 CRITICAL: DUPLICATE PREVENTION 🚫🚫🚫
-You MUST NOT generate any of these {len(existing_words)} words that have already been used:
+═══════════════════════════════════════════════════════════════
+🚫 BANNED VOCABULARY - DO NOT USE ANY OF THESE {len(existing_words)} WORDS 🚫
+═══════════════════════════════════════════════════════════════
 
-BANNED WORDS (generate COMPLETELY DIFFERENT vocabulary):
-{', '.join(display_words)}{'...' if len(existing_words) > 150 else ''}
+{banned_words_list}
 
-⚠️ ANY duplicate will cause the card to be REJECTED and require regeneration.
-⚠️ Use DIFFERENT word categories if needed: colors, weather, body parts, emotions, food, animals, furniture, clothing, sports, occupations, nature, time expressions, etc.
-⚠️ Check EVERY word you generate against this list before including it.
-🚫🚫🚫 END BANNED LIST 🚫🚫🚫"""
+═══════════════════════════════════════════════════════════════
+
+BEFORE generating each word, CHECK if it appears in the banned list above.
+If it does, pick a DIFFERENT word from a DIFFERENT category.
+
+Categories to try: colors, weather, body parts, emotions, food, drinks, 
+animals, furniture, clothing, sports, occupations, nature, time, numbers,
+family, hobbies, transportation, buildings, kitchen items, office supplies."""
         
         conjugation_schema = """
 For VERB cards (part_of_speech: "verb"), ALWAYS follow with a conjugation_table card:
@@ -2686,19 +2699,25 @@ Each card needs: type, title, word, translation, explanation, example_sentence, 
 For conjugation_table cards: infinitive, translation, tense, verb_type, conjugations (dict), conjugation_examples (list).
 {f'Theme: {theme}' if theme else ''}"""
 
+        # Build user message with banned words reminder
+        user_content = f"Generate {num_cards} {batch_type} cards now."
+        if existing_words:
+            user_content += f"\n\n⚠️ REMINDER: Do NOT use any of these {len(existing_words)} banned words: {banned_words_list}"
+        
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Generate {num_cards} {batch_type} cards now."},
+            {"role": "user", "content": user_content},
         ]
         
         logger.api_call(f"chat.completions.create (teaching_batch_{batch_type})", model=DEFAULT_CHAT_MODEL)
+        logger.debug(f"Banned words for this batch ({len(existing_words or [])}): {', '.join((existing_words or [])[:20])}...")
         with Timer() as timer:
             completion = client.chat.completions.create(
                 model=DEFAULT_CHAT_MODEL,
                 response_format={"type": "json_object"},
                 messages=messages,
                 temperature=0.7,
-                max_tokens=2000,  # Smaller for faster response
+                max_tokens=3000,  # Increased for better response with context
             )
         logger.api_response(f"teaching_batch_{batch_type}", duration_ms=timer.duration_ms)
         
@@ -3069,16 +3088,16 @@ def _generate_teaching_content_batched(
     
     # Pre-populate with known words from learner context to avoid duplicates
     generated_words: List[str] = []
+    generated_grammar: List[str] = []  # Track grammar concepts separately
+    
     if learner_context:
         # Extract known words from learner context string
         # Look for the "WORDS ALREADY KNOWN" section
         if "WORDS ALREADY KNOWN" in learner_context:
             try:
-                # Find the line with the words
                 lines = learner_context.split('\n')
                 for i, line in enumerate(lines):
                     if "WORDS ALREADY KNOWN" in line:
-                        # Next line(s) contain the words
                         if i + 1 < len(lines):
                             words_line = lines[i + 1].strip()
                             if words_line:
@@ -3088,6 +3107,22 @@ def _generate_teaching_content_batched(
                         break
             except Exception as e:
                 logger.warning(f"Could not parse known words from context: {e}")
+        
+        # Extract known grammar concepts from learner context
+        if "GRAMMAR CONCEPTS ALREADY TAUGHT" in learner_context:
+            try:
+                lines = learner_context.split('\n')
+                for i, line in enumerate(lines):
+                    if "GRAMMAR CONCEPTS ALREADY TAUGHT" in line:
+                        if i + 1 < len(lines):
+                            grammar_line = lines[i + 1].strip()
+                            if grammar_line:
+                                known_grammar = [g.strip() for g in grammar_line.split(',') if g.strip()]
+                                generated_grammar.extend(known_grammar)
+                                logger.debug(f"Pre-loaded {len(known_grammar)} known grammar concepts to avoid duplicates")
+                        break
+            except Exception as e:
+                logger.warning(f"Could not parse known grammar from context: {e}")
     
     # Calculate batches: vocab(6), vocab(6), grammar(3), review(5)
     batches = [
@@ -3117,22 +3152,44 @@ def _generate_teaching_content_batched(
             existing_words=generated_words,
         )
         
-        # Track words to avoid duplicates (including verb infinitives)
-        # Track both original and normalized forms for robust duplicate detection
+        # Track words and grammar to avoid duplicates - be thorough!
+        words_added_this_batch = []
+        grammar_added_this_batch = []
+        
         for card in cards:
+            # Track the main word
             if card.word:
-                generated_words.append(card.word)
-                # Also add normalized version for matching
+                if card.word not in generated_words:
+                    generated_words.append(card.word)
+                    words_added_this_batch.append(card.word)
+                # Also add normalized version
                 normalized = _normalize_word(card.word, language)
                 if normalized and normalized not in generated_words:
                     generated_words.append(normalized)
-            # Also track infinitives from conjugation tables
+            
+            # Track translations to avoid teaching same concept
+            if card.translation:
+                if card.translation not in generated_words:
+                    generated_words.append(card.translation)
+            
+            # Track infinitives from conjugation tables
             if card.infinitive:
                 if card.infinitive not in generated_words:
                     generated_words.append(card.infinitive)
+                    words_added_this_batch.append(card.infinitive)
                 normalized_inf = _normalize_word(card.infinitive, language)
                 if normalized_inf and normalized_inf not in generated_words:
                     generated_words.append(normalized_inf)
+            
+            # Track grammar concepts
+            if card.type == "grammar_lesson" and card.grammar_rule:
+                if card.grammar_rule not in generated_grammar:
+                    generated_grammar.append(card.grammar_rule)
+                    grammar_added_this_batch.append(card.grammar_rule)
+                    # Also add to words list for cross-reference
+                    generated_words.append(card.grammar_rule)
+        
+        logger.debug(f"Added {len(words_added_this_batch)} new words, {len(grammar_added_this_batch)} grammar concepts")
         
         all_cards.extend(cards)
         

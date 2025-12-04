@@ -1623,6 +1623,33 @@ class LanguageBuddyApp(tk.Tk):
         db.save_session(self.current_session)
         logger.success(f"Session saved: {self.current_session.session_id}")
         
+        # Save grammar concepts from teaching plan
+        if self.teaching_plan and self.teaching_plan.grammar_concepts:
+            from core.database import GrammarPattern
+            for concept_name in self.teaching_plan.grammar_concepts:
+                if not concept_name:
+                    continue
+                # Check if pattern already exists
+                existing = db.get_grammar_pattern(concept_name, language)
+                if existing:
+                    # Update existing pattern
+                    existing.times_practiced += 1
+                    existing.last_seen = datetime.now(timezone.utc).isoformat()
+                    db.save_grammar_pattern(existing)
+                else:
+                    # Create new pattern
+                    pattern = GrammarPattern(
+                        pattern_id="",  # Will be generated
+                        name=concept_name,
+                        language=language,
+                        description=f"Grammar concept: {concept_name}",
+                        times_practiced=1,
+                        first_seen=datetime.now(timezone.utc).isoformat(),
+                        last_seen=datetime.now(timezone.utc).isoformat(),
+                    )
+                    db.save_grammar_pattern(pattern)
+            logger.success(f"Saved {len(self.teaching_plan.grammar_concepts)} grammar concepts")
+        
         # Update language profile
         lang_profile = db.get_language_profile(language)
         if self.assessment_result:

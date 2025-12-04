@@ -1056,6 +1056,41 @@ class DatabaseClient:
             logger.error(f"Error saving grammar pattern: {e}")
             return False
     
+    def get_all_grammar_patterns(
+        self,
+        language: str,
+        user_id: Optional[str] = None
+    ) -> List[GrammarPattern]:
+        """Get all grammar patterns the user has learned for a language."""
+        uid = user_id or self._user_id
+        
+        if not self.is_connected():
+            # Return from cache
+            patterns = []
+            prefix = f"{uid}_grammar_"
+            for key, value in self._cache.items():
+                if key.startswith(prefix):
+                    pattern = GrammarPattern.from_dict(value)
+                    if pattern.language == language:
+                        patterns.append(pattern)
+            return patterns
+        
+        try:
+            docs = self.db.collection("users").document(uid)\
+                         .collection("grammar").get()
+            
+            patterns = []
+            for doc in docs:
+                data = doc.to_dict()
+                if data and data.get("language") == language:
+                    patterns.append(GrammarPattern.from_dict(data))
+            
+            return patterns
+            
+        except Exception as e:
+            logger.error(f"Error getting grammar patterns: {e}")
+            return []
+    
     # ---------------------------------------------------------------------------
     # Session Operations
     # ---------------------------------------------------------------------------
@@ -1300,6 +1335,10 @@ class DatabaseClient:
         # Get frequent error patterns
         frequent_errors = self.get_frequent_errors(language, uid, min_occurrences=2, limit=10)
         
+        # Get all grammar patterns the user has learned
+        all_grammar = self.get_all_grammar_patterns(language, uid)
+        all_grammar_concepts = [g.name for g in all_grammar if g.name]
+        
         # Vocabulary summary
         vocab_summary = {
             "total_words_learned": len(all_vocab),
@@ -1347,6 +1386,23 @@ class DatabaseClient:
             "current_streak": lang_profile.current_streak_days if lang_profile else 0,
         }
         
+        # Grammar summary
+        grammar_summary = {
+            "total_concepts_learned": len(all_grammar),
+            "mastered_count": len([g for g in all_grammar if g.strength_rating == "mastered"]),
+            "learning_count": len([g for g in all_grammar if g.strength_rating in ["learning", "familiar"]]),
+            "all_grammar_concepts": all_grammar_concepts,  # ALL grammar concepts learned (for avoiding duplicates)
+            "grammar_patterns": [
+                {
+                    "name": g.name,
+                    "description": g.description,
+                    "strength": g.strength_rating,
+                    "times_practiced": g.times_practiced,
+                }
+                for g in all_grammar[:20]  # Recent/active patterns
+            ],
+        }
+        
         # Build the context object
         context = {
             "user_id": uid,
@@ -1363,6 +1419,7 @@ class DatabaseClient:
             "weaknesses": lang_profile.weaknesses if lang_profile else [],
             "recommendations": lang_profile.recommendations if lang_profile else [],
             "vocabulary": vocab_summary,
+            "grammar": grammar_summary,  # Added grammar tracking
             "errors": error_summary,
             "sessions": session_summary,
             "learning_goals": lang_profile.current_goals if lang_profile else [],
@@ -1440,6 +1497,19 @@ class DatabaseClient:
                 "",
                 f"WORDS ALREADY KNOWN - DO NOT TEACH THESE ({len(all_known_words)} words):",
                 f"  {', '.join(all_known_words)}"  # Include ALL known words
+            ])
+        
+        # Add grammar concepts already learned - DO NOT REPEAT THESE
+        grammar_context = context.get('grammar', {})
+        all_grammar_concepts = grammar_context.get('all_grammar_concepts', [])
+        if all_grammar_concepts:
+            lines.extend([
+                "",
+                f"GRAMMAR CONCEPTS ALREADY TAUGHT - DO NOT REPEAT ({len(all_grammar_concepts)} concepts):",
+                f"  {', '.join(all_grammar_concepts)}",
+                "",
+                "⚠️ Generate NEW grammar concepts that are NOT in the list above.",
+                "Try: verb tenses, cases, word order, articles, pronouns, prepositions, etc.",
             ])
         
         lines.extend([
