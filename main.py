@@ -253,41 +253,45 @@ class ScrollableFrame(ttk.Frame):
             pass
     
     def _bind_mousewheel(self) -> None:
-        """Bind mousewheel events for scrolling."""
-        # Bind to canvas and all children
-        self.canvas.bind("<Enter>", self._bind_wheel_events)
-        self.canvas.bind("<Leave>", self._unbind_wheel_events)
-    
-    def _bind_wheel_events(self, event: tk.Event) -> None:
-        """Bind mousewheel when mouse enters."""
-        # Windows and macOS have different mousewheel events
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        """Bind mousewheel events globally for scrolling anywhere in the window."""
+        # Get the root window to bind globally
+        root = self.winfo_toplevel()
+        
+        # Windows and macOS use MouseWheel event
+        root.bind_all("<MouseWheel>", self._on_mousewheel)
         # Linux uses Button-4 and Button-5
-        self.canvas.bind_all("<Button-4>", self._on_mousewheel_linux)
-        self.canvas.bind_all("<Button-5>", self._on_mousewheel_linux)
-    
-    def _unbind_wheel_events(self, event: tk.Event) -> None:
-        """Unbind mousewheel when mouse leaves."""
-        self.canvas.unbind_all("<MouseWheel>")
-        self.canvas.unbind_all("<Button-4>")
-        self.canvas.unbind_all("<Button-5>")
+        root.bind_all("<Button-4>", self._on_mousewheel_linux)
+        root.bind_all("<Button-5>", self._on_mousewheel_linux)
     
     def _on_mousewheel(self, event: tk.Event) -> None:
         """Handle mousewheel on Windows/macOS."""
-        # Only scroll if scrollbar is visible (content overflows)
-        if not self._scrollbar_visible:
+        # Only scroll if this ScrollableFrame is currently visible
+        try:
+            if not self.winfo_viewable():
+                return
+        except tk.TclError:
             return
-        # event.delta is positive for scroll up, negative for scroll down
-        # Windows: delta is typically 120 or -120
-        # macOS: delta can be smaller values
+        
+        # Scroll regardless of scrollbar visibility - canvas handles bounds
         if event.delta:
-            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            # macOS has smaller delta values, normalize
+            if abs(event.delta) < 10:
+                # macOS trackpad - delta is usually 1-5
+                scroll_amount = -1 if event.delta > 0 else 1
+            else:
+                # Windows/macOS mouse wheel - delta is usually 120
+                scroll_amount = int(-1 * (event.delta / 120))
+            self.canvas.yview_scroll(scroll_amount, "units")
     
     def _on_mousewheel_linux(self, event: tk.Event) -> None:
         """Handle mousewheel on Linux."""
-        # Only scroll if scrollbar is visible (content overflows)
-        if not self._scrollbar_visible:
+        # Only scroll if this ScrollableFrame is currently visible
+        try:
+            if not self.winfo_viewable():
+                return
+        except tk.TclError:
             return
+        
         if event.num == 4:
             self.canvas.yview_scroll(-1, "units")
         elif event.num == 5:
@@ -908,9 +912,238 @@ class SpeechRecorder(ttk.Frame):
         self._is_recording = False
         self._recording_data = []
         self._recording_path = None
-        self.transcription_label.pack_forget()
-        self.status_label.configure(text="Click the button to start recording", foreground="#7bb3ff")
-        self.record_button.configure(text="🎤 Click to Start Recording")
+        try:
+            self.transcription_label.pack_forget()
+            self.status_label.configure(text="Click the button to start recording", foreground="#7bb3ff")
+            self.record_button.configure(text="🎤 Click to Start Recording")
+        except tk.TclError:
+            pass  # Widgets already destroyed
+
+
+# ---------------------------------------------------------------------------
+# Word Order Widget (Duolingo-style sentence building)
+# ---------------------------------------------------------------------------
+
+class WordOrderWidget(ttk.Frame):
+    """
+    A widget for word ordering exercises (Duolingo-style).
+    Users click words from a word bank to build a sentence.
+    """
+    
+    def __init__(self, parent, on_answer_ready: Optional[Callable[[str], None]] = None, **kwargs) -> None:
+        super().__init__(parent, **kwargs)
+        
+        self._on_answer_ready = on_answer_ready
+        self._word_bank: List[str] = []
+        self._selected_words: List[str] = []
+        self._word_buttons: Dict[str, ttk.Button] = {}
+        self._answer_buttons: List[ttk.Button] = []
+        
+        # Source sentence (what to translate)
+        self.source_frame = ttk.Frame(self)
+        self.source_frame.pack(fill="x", pady=(0, 15))
+        
+        self.source_label = ttk.Label(
+            self.source_frame,
+            text="Translate this sentence:",
+            font=("Helvetica", 11),
+            foreground="#7bb3ff",
+        )
+        self.source_label.pack(anchor="w")
+        
+        self.source_sentence_label = ttk.Label(
+            self.source_frame,
+            text="",
+            font=("Helvetica", 14, "bold"),
+            foreground="#e0e0e0",
+            wraplength=500,
+        )
+        self.source_sentence_label.pack(anchor="w", pady=(5, 0))
+        
+        # Answer area (where selected words appear)
+        self.answer_frame = ttk.LabelFrame(self, text="Your Answer", padding=10)
+        self.answer_frame.pack(fill="x", pady=(0, 15))
+        
+        self.answer_container = ttk.Frame(self.answer_frame)
+        self.answer_container.pack(fill="x")
+        
+        # Placeholder for empty answer
+        self.placeholder_label = ttk.Label(
+            self.answer_container,
+            text="Click words below to build your sentence...",
+            font=("Helvetica", 11),
+            foreground="#666666",
+        )
+        self.placeholder_label.pack(pady=10)
+        
+        # Word bank (scrambled words to choose from)
+        self.bank_frame = ttk.LabelFrame(self, text="Word Bank", padding=10)
+        self.bank_frame.pack(fill="x")
+        
+        self.bank_container = ttk.Frame(self.bank_frame)
+        self.bank_container.pack(fill="x")
+        
+        # Clear button
+        self.clear_button = ttk.Button(
+            self,
+            text="🔄 Clear All",
+            command=self._clear_answer,
+            width=12,
+        )
+        self.clear_button.pack(pady=(10, 0))
+    
+    def set_words(self, scrambled_words: List[str], source_sentence: str = "", 
+                  distractor_words: Optional[List[str]] = None) -> None:
+        """Set up the word ordering exercise."""
+        self._word_bank = list(scrambled_words)
+        if distractor_words:
+            self._word_bank.extend(distractor_words)
+            # Shuffle to mix distractors in
+            import random
+            random.shuffle(self._word_bank)
+        
+        self._selected_words = []
+        self.source_sentence_label.configure(text=f'"{source_sentence}"')
+        
+        # Clear existing buttons
+        for btn in self._word_buttons.values():
+            btn.destroy()
+        self._word_buttons.clear()
+        
+        for btn in self._answer_buttons:
+            btn.destroy()
+        self._answer_buttons.clear()
+        
+        # Show placeholder
+        self.placeholder_label.pack(pady=10)
+        
+        # Create word bank buttons
+        for widget in self.bank_container.winfo_children():
+            widget.destroy()
+        
+        # Use a flow layout for words
+        row_frame = ttk.Frame(self.bank_container)
+        row_frame.pack(fill="x", pady=2)
+        
+        for i, word in enumerate(self._word_bank):
+            btn = ttk.Button(
+                row_frame,
+                text=word,
+                command=lambda w=word: self._select_word(w),
+                width=max(6, len(word) + 2),
+            )
+            btn.pack(side="left", padx=3, pady=3)
+            self._word_buttons[word] = btn
+            
+            # Start new row after ~5 words
+            if (i + 1) % 5 == 0 and i < len(self._word_bank) - 1:
+                row_frame = ttk.Frame(self.bank_container)
+                row_frame.pack(fill="x", pady=2)
+    
+    def _select_word(self, word: str) -> None:
+        """Handle word selection from bank."""
+        if word not in self._selected_words:
+            self._selected_words.append(word)
+            
+            # Hide placeholder
+            self.placeholder_label.pack_forget()
+            
+            # Disable the word in the bank
+            if word in self._word_buttons:
+                self._word_buttons[word].configure(state="disabled")
+            
+            # Add to answer area
+            self._update_answer_display()
+            
+            # Notify callback
+            if self._on_answer_ready:
+                self._on_answer_ready(" ".join(self._selected_words))
+    
+    def _remove_word(self, word: str, index: int) -> None:
+        """Remove a word from the answer."""
+        if 0 <= index < len(self._selected_words):
+            self._selected_words.pop(index)
+            
+            # Re-enable in word bank
+            if word in self._word_buttons:
+                self._word_buttons[word].configure(state="normal")
+            
+            # Update display
+            self._update_answer_display()
+            
+            # Notify callback
+            if self._on_answer_ready:
+                answer = " ".join(self._selected_words) if self._selected_words else ""
+                self._on_answer_ready(answer)
+    
+    def _update_answer_display(self) -> None:
+        """Update the answer area display."""
+        # Clear existing answer buttons
+        for btn in self._answer_buttons:
+            btn.destroy()
+        self._answer_buttons.clear()
+        
+        if not self._selected_words:
+            self.placeholder_label.pack(pady=10)
+            return
+        
+        # Create buttons for selected words (click to remove)
+        for i, word in enumerate(self._selected_words):
+            btn = ttk.Button(
+                self.answer_container,
+                text=word,
+                command=lambda w=word, idx=i: self._remove_word(w, idx),
+                width=max(6, len(word) + 2),
+            )
+            btn.pack(side="left", padx=3, pady=5)
+            self._answer_buttons.append(btn)
+    
+    def _clear_answer(self) -> None:
+        """Clear all selected words."""
+        for word in self._selected_words:
+            if word in self._word_buttons:
+                try:
+                    self._word_buttons[word].configure(state="normal")
+                except tk.TclError:
+                    pass  # Button already destroyed
+        
+        self._selected_words.clear()
+        self._update_answer_display()
+        try:
+            self.placeholder_label.pack(pady=10)
+        except tk.TclError:
+            pass  # Widget already destroyed
+        
+        if self._on_answer_ready:
+            self._on_answer_ready("")
+    
+    def get_answer(self) -> str:
+        """Get the current answer as a space-separated string."""
+        return " ".join(self._selected_words)
+    
+    def get_word_list(self) -> List[str]:
+        """Get the current answer as a list of words."""
+        return list(self._selected_words)
+    
+    def reset(self) -> None:
+        """Reset the widget for a new exercise."""
+        self._selected_words.clear()
+        self._word_bank.clear()
+        
+        # Safely destroy buttons
+        for btn in self._word_buttons.values():
+            try:
+                btn.destroy()
+            except tk.TclError:
+                pass  # Already destroyed
+        self._word_buttons.clear()
+        
+        for btn in self._answer_buttons:
+            try:
+                btn.destroy()
+            except tk.TclError:
+                pass  # Already destroyed
+        self._answer_buttons.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1009,7 +1242,7 @@ class LanguageBuddyApp(tk.Tk):
 
         logger.ui("Application initialized successfully")
         self.show_card("IntroCard")
-    
+
     def _init_database(self) -> None:
         """Initialize database connection."""
         logger.task_start("database_initialization")
@@ -1105,6 +1338,153 @@ class LanguageBuddyApp(tk.Tk):
             db.save_vocabulary_item(vocab_item)
         
         logger.debug(f"Tracked {len(words_to_track)} vocabulary words from card")
+        
+        # Track error patterns if the answer was incorrect
+        if not card.is_correct and card.user_response:
+            self._track_error_patterns(card, evaluation)
+    
+    def _track_vocabulary_from_teaching_card(self, card: TeachingCard) -> None:
+        """
+        Track vocabulary when a teaching card is shown (before quiz).
+        This marks words as 'introduced' even before they're tested.
+        """
+        from datetime import datetime
+        
+        db = get_db()
+        language = self.selected_language or "Spanish"
+        
+        words_to_track = []
+        
+        # Vocabulary intro cards
+        if card.type == "vocabulary_intro" and card.word:
+            words_to_track.append({
+                "word": card.word,
+                "translation": card.translation or "",
+                "part_of_speech": card.part_of_speech or "",
+                "example": card.example_sentence or "",
+            })
+        
+        # Conjugation table cards (verbs)
+        elif card.type == "conjugation_table" and card.infinitive:
+            words_to_track.append({
+                "word": card.infinitive,
+                "translation": card.translation or "",
+                "part_of_speech": "verb",
+                "example": "",
+            })
+        
+        # Phrase lesson cards
+        elif card.type == "phrase_lesson" and card.word:
+            words_to_track.append({
+                "word": card.word,
+                "translation": card.translation or "",
+                "part_of_speech": "phrase",
+                "example": card.example_sentence or "",
+            })
+        
+        # Concept review cards
+        elif card.type == "concept_review" and card.word:
+            words_to_track.append({
+                "word": card.word,
+                "translation": card.translation or "",
+                "part_of_speech": card.part_of_speech or "",
+                "example": card.example_sentence or "",
+            })
+        
+        # Track each word
+        for word_data in words_to_track:
+            word = word_data["word"]
+            if not word or len(word) < 2:
+                continue
+            
+            # Track in session
+            if word not in self.session_vocabulary:
+                self.session_vocabulary.append(word)
+            
+            # Get or create vocabulary item
+            vocab_item = db.get_vocabulary_item(word, language)
+            is_new_word = vocab_item is None
+            
+            if not vocab_item:
+                vocab_item = VocabularyItem(
+                    word=word,
+                    translation=word_data.get("translation", ""),
+                    language=language,
+                )
+                if self.current_session:
+                    self.current_session.new_vocabulary.append(word)
+            
+            # Record as "seen" (introduced) - not tested yet
+            # This gives a small strength boost just for being introduced
+            vocab_item.times_seen += 1
+            if not vocab_item.first_seen:
+                vocab_item.first_seen = datetime.now().isoformat()
+            vocab_item.last_seen = datetime.now().isoformat()
+            
+            # Recalculate strength (will be low since not tested, but tracked)
+            vocab_item.calculate_strength()
+            
+            # Save to database
+            db.save_vocabulary_item(vocab_item)
+            
+            if is_new_word:
+                logger.debug(f"[VOCAB] New word introduced: '{word}'")
+        
+        if words_to_track:
+            logger.debug(f"[VOCAB] Tracked {len(words_to_track)} words from teaching card: {card.type}")
+    
+    def _track_error_patterns(self, card: LessonCard, evaluation: Dict[str, Any]) -> None:
+        """Track error patterns from incorrect answers for targeted practice."""
+        db = get_db()
+        language = self.selected_language or "Spanish"
+        
+        # Get error types from card or evaluation
+        error_types = card.error_types or []
+        
+        # For writing practice, check writing_feedback for error types
+        if card.type == "writing_practice" and card.writing_feedback:
+            feedback_errors = card.writing_feedback.get("error_types", [])
+            grammar_errors = card.writing_feedback.get("grammar_errors", [])
+            
+            # Add error types from feedback
+            for e_type in feedback_errors:
+                if e_type not in error_types:
+                    error_types.append(e_type)
+            
+            # Track individual grammar errors
+            for error in grammar_errors:
+                if isinstance(error, dict):
+                    db.save_error_pattern(
+                        error_type=error.get("error_type", "grammar"),
+                        incorrect_form=error.get("error", ""),
+                        correct_form=error.get("correction", ""),
+                        language=language,
+                        context=card.user_response or "",
+                    )
+        
+        # Infer error types from card type if none specified
+        if not error_types:
+            if card.type == "fill_in_blank":
+                error_types = ["fill_in_blank_error"]
+            elif card.type == "multiple_choice":
+                error_types = ["comprehension_error"]
+            elif card.type == "text_question":
+                error_types = ["translation_error"]
+            elif card.type == "image_question":
+                error_types = ["vocabulary_error"]
+        
+        # Save error pattern if we have user response and correct answer
+        if card.user_response and card.correct_answer:
+            for error_type in error_types[:3]:  # Limit to 3 error types
+                db.save_error_pattern(
+                    error_type=error_type,
+                    incorrect_form=card.user_response,
+                    correct_form=card.correct_answer,
+                    language=language,
+                    context=card.question or "",
+                )
+        
+        logger.debug(f"Tracked {len(error_types)} error patterns from incorrect answer")
     
     def _save_session_to_database(self) -> None:
         """Save session record and update language profile."""
@@ -1225,37 +1605,38 @@ class LanguageBuddyApp(tk.Tk):
                 recommendations=lang_profile.recommendations,
             )
             
-            # Go directly to lesson generation
+            # Go directly to lesson generation (skip assessment entirely)
             self._generate_lessons_for_returning_learner()
-        else:
-            # New learner - run full assessment
-            logger.ui("New learner - starting comprehensive assessment...")
-            self.current_session.session_type = "assessment"
-            
-            # Show loading spinner and switch to assessment card
-            assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
-            assessment_card.show_loading("Generating assessment questions (10-12 questions)...")
-            self.show_card("AssessmentCardView")
+            return  # Important: Don't fall through to assessment code!
+        
+        # New learner - run full assessment
+        logger.ui("New learner - starting comprehensive assessment...")
+        self.current_session.session_type = "assessment"
 
-            # Run API calls in a background thread
-            def generate_assessment_threaded():
-                logger.task_start("generate_assessment_threaded")
-                try:
-                    # Generate all assessment cards (comprehensive 10-12 question assessment)
-                    assessment_cards = generate_assessment_cards(language)
-                    logger.task_complete("generate_assessment_threaded")
+        # Show loading spinner and switch to assessment card
+        assessment_card: AssessmentCardView = self.cards["AssessmentCardView"]
+        assessment_card.show_loading("Generating assessment questions (10-12 questions)...")
+        self.show_card("AssessmentCardView")
 
-                    # Show questions ASAP; images are fetched per-card on demand
-                    self.after(0, lambda: self._on_assessment_generated(assessment_cards))
+        # Run API calls in a background thread
+        def generate_assessment_threaded():
+            logger.task_start("generate_assessment_threaded")
+            try:
+                # Generate all assessment cards (comprehensive 10-12 question assessment)
+                assessment_cards = generate_assessment_cards(language)
+                logger.task_complete("generate_assessment_threaded")
 
-                except Exception as e:
-                    logger.task_error("generate_assessment_threaded", str(e))
-                    # Show error in main thread
-                    self.after(0, lambda: self._on_assessment_error(str(e)))
+                # Show questions ASAP; images are fetched per-card on demand
+                self.after(0, lambda: self._on_assessment_generated(assessment_cards))
 
-            thread = threading.Thread(target=generate_assessment_threaded, daemon=True)
-            thread.start()
-            logger.task("Spawned background thread for assessment generation")
+            except Exception as e:
+                logger.task_error("generate_assessment_threaded", str(e))
+                # Show error in main thread
+                self.after(0, lambda: self._on_assessment_error(str(e)))
+
+        thread = threading.Thread(target=generate_assessment_threaded, daemon=True)
+        thread.start()
+        logger.task("Spawned background thread for assessment generation")
     
     def _generate_lessons_for_returning_learner(self) -> None:
         """Generate teaching and quiz content for a returning learner (skip assessment)."""
@@ -1586,8 +1967,8 @@ class LanguageBuddyApp(tk.Tk):
                     db = get_db()
                     if db.is_connected():
                         self._learner_context = db.generate_llm_context_string(
-                            self.selected_language or "Spanish"
-                        )
+                        self.selected_language or "Spanish"
+                    )
                         logger.debug(f"Loaded learner context: {len(self._learner_context)} chars")
                     
                     # Evaluate assessment responses (one API call)
@@ -1678,7 +2059,7 @@ class LanguageBuddyApp(tk.Tk):
             # Update UI if this card is currently displayed
             lesson_card: LessonCardView = self.cards["LessonCardView"]
             lesson_card.update_image_if_needed(image_prompt, image_path)
-    
+
     def _on_any_image_generated(self, image_prompt: str, image_path: Optional[str]) -> None:
         """Called when any image (teaching or quiz) is generated."""
         if not image_path:
@@ -1783,6 +2164,11 @@ class LanguageBuddyApp(tk.Tk):
             lesson_card.hide_loading()
             lesson_card.show_card_index(0)
         else:
+            # Update loading message with progress indicator
+            lesson_card: LessonCardView = self.cards["LessonCardView"]
+            dots = "." * ((self._quiz_wait_count if hasattr(self, '_quiz_wait_count') else 0) % 4)
+            self._quiz_wait_count = getattr(self, '_quiz_wait_count', 0) + 1
+            lesson_card.show_loading(f"Generating your personalized quiz{dots}\n\n(Based on the vocabulary you just learned)")
             # Check again in 500ms
             self.after(500, self._wait_for_quiz_content)
 
@@ -2023,7 +2409,7 @@ class IntroCard(ttk.Frame):
         )
         desc.grid(row=1, column=0, padx=40, pady=(0, 20))
         self.desc_label = desc
-        
+
         # Language selection for new/continue
         lang_frame = ttk.Frame(self.content)
         lang_frame.grid(row=2, column=0, padx=40, pady=(0, 20))
@@ -2055,7 +2441,7 @@ class IntroCard(ttk.Frame):
             relief='solid',
             arrowcolor='#ffffff',
         )
-        
+
         # Selected language stats panel (shown when a language with progress is selected)
         self.selected_stats_frame = ttk.Frame(self.content)
         self.selected_stats_frame.grid(row=3, column=0, pady=(15, 10))
@@ -2577,7 +2963,7 @@ class AssessmentCardView(ttk.Frame):
         
         self.text_widget = tk.Text(
             text_frame, 
-            height=8,
+            height=8, 
             width=60,  # Fixed width for consistent centering
             wrap="word",
             bg="#2d2d2d",  # Dark background
@@ -3147,6 +3533,9 @@ class TeachingCardView(ttk.Frame):
         card = self.teaching_plan.cards[self.current_index]
         total = len(self.teaching_plan.cards)
         
+        # Track vocabulary from this teaching card (mark as "introduced/seen")
+        self.controller._track_vocabulary_from_teaching_card(card)
+        
         # Update progress
         card_type_display = "New" if card.is_new else "Review"
         self.progress_label.configure(
@@ -3604,6 +3993,10 @@ class LessonCardView(ttk.Frame):
         # Speech recorder (for speaking exercises)
         self.speech_recorder: Optional[SpeechRecorder] = None
         self.current_transcription: Optional[str] = None
+        
+        # Word order widget (for sentence building exercises)
+        self.word_order_widget: Optional[WordOrderWidget] = None
+        self.current_word_order_answer: str = ""
 
         self.next_button = ttk.Button(
             self.content, text="Submit Answer", command=self._on_next_clicked
@@ -3738,6 +4131,23 @@ class LessonCardView(ttk.Frame):
         # Clear previous widgets
         self._clear_card_widgets()
         
+        # Set dynamic title based on card type
+        card_type_titles = {
+            "multiple_choice": "Quiz Question",
+            "fill_in_blank": "Fill in the Blank",
+            "image_question": "Picture Question",
+            "text_question": "Translation",
+            "audio_transcription": "Listening Practice",
+            "audio_comprehension": "Listening Comprehension",
+            "speaking": "Speaking Practice",
+            "reading_comprehension": "Reading Comprehension",
+            "writing_practice": "Writing Practice",
+            "word_order": "Build the Sentence",
+            "vocabulary": "Vocabulary",
+        }
+        title = card_type_titles.get(card.type, "Quiz Question")
+        self.title_label.configure(text=title)
+        
         # Show instruction if available
         if card.instruction:
             self.subtitle_label.configure(text=card.instruction)
@@ -3770,6 +4180,12 @@ class LessonCardView(ttk.Frame):
             self._render_audio_card(card)
         elif card.type == "speaking":
             self._render_speaking_card(card)
+        elif card.type == "reading_comprehension":
+            self._render_reading_comprehension(card)
+        elif card.type == "writing_practice":
+            self._render_writing_practice(card)
+        elif card.type == "word_order":
+            self._render_word_order(card)
         else:
             self._render_text_input(card)
     
@@ -3985,6 +4401,274 @@ class LessonCardView(ttk.Frame):
         # Show brief feedback then move to next card
         self._show_skip_feedback("Speaking exercise skipped", card)
     
+    def _render_reading_comprehension(self, card: LessonCard) -> None:
+        """Render reading comprehension exercise with passage and questions."""
+        # Clear MC buttons if any
+        if hasattr(self, 'mc_buttons'):
+            for btn in self.mc_buttons:
+                btn.destroy()
+            self.mc_buttons = []
+        
+        # Hide image and audio areas
+        self.responsive_image.grid_remove()
+        if self.audio_player:
+            self.audio_player.grid_remove()
+        if self.speech_recorder:
+            self.speech_recorder.grid_remove()
+        if self.word_order_widget:
+            self.word_order_widget.pack_forget()
+        
+        # Create passage frame
+        passage_frame = ttk.LabelFrame(self.answer_frame, text="📖 Reading Passage", padding=10)
+        passage_frame.pack(fill="x", pady=(0, 15))
+        
+        # Display passage
+        passage_text = card.reading_passage or "No passage provided."
+        passage_label = tk.Text(
+            passage_frame,
+            wrap="word",
+            height=8,
+            width=60,
+            font=("Helvetica", 12),
+            bg="#2a2a2a",
+            fg="#e0e0e0",
+            relief="flat",
+            padx=10,
+            pady=10,
+        )
+        passage_label.insert("1.0", passage_text)
+        passage_label.configure(state="disabled")
+        passage_label.pack(fill="x", pady=5)
+        
+        # Show vocabulary highlights if available
+        if card.vocabulary_highlights:
+            vocab_frame = ttk.Frame(passage_frame)
+            vocab_frame.pack(fill="x", pady=(5, 0))
+            
+            ttk.Label(
+                vocab_frame,
+                text="📚 Key Vocabulary:",
+                font=("Helvetica", 10, "bold"),
+                foreground="#7bb3ff",
+            ).pack(anchor="w")
+            
+            vocab_text = ", ".join([
+                f"{v.get('word', '')} ({v.get('translation', '')})" 
+                for v in card.vocabulary_highlights[:6]
+            ])
+            ttk.Label(
+                vocab_frame,
+                text=vocab_text,
+                font=("Helvetica", 10),
+                foreground="#a0a0a0",
+                wraplength=500,
+            ).pack(anchor="w")
+        
+        # Question section
+        question_frame = ttk.LabelFrame(self.answer_frame, text="❓ Questions", padding=10)
+        question_frame.pack(fill="x", pady=(0, 10))
+        
+        # Show questions
+        questions = card.reading_questions or []
+        if questions:
+            for i, q in enumerate(questions[:3], 1):
+                q_text = q.get("question", "") if isinstance(q, dict) else str(q)
+                ttk.Label(
+                    question_frame,
+                    text=f"{i}. {q_text}",
+                    font=("Helvetica", 11),
+                    foreground="#d0d0d0",
+                    wraplength=500,
+                ).pack(anchor="w", pady=2)
+        else:
+            ttk.Label(
+                question_frame,
+                text=card.question or "Answer questions about the passage.",
+                font=("Helvetica", 11),
+                foreground="#d0d0d0",
+                wraplength=500,
+            ).pack(anchor="w")
+        
+        # Answer text area
+        answer_label = ttk.Label(
+            self.answer_frame,
+            text="Your Answer:",
+            font=("Helvetica", 11),
+            foreground="#7bb3ff",
+        )
+        answer_label.pack(anchor="w", pady=(10, 5))
+        
+        text_frame = ttk.Frame(self.answer_frame)
+        text_frame.pack(fill="x", pady=(0, 10))
+        
+        self.text_widget = tk.Text(
+            text_frame,
+            wrap="word",
+            height=4,
+            width=50,
+            font=("Helvetica", 12),
+            bg="#1e1e1e",
+            fg="#ffffff",
+            insertbackground="#ffffff",
+            relief="flat",
+            padx=10,
+            pady=10,
+        )
+        self.text_widget.pack(side="left", fill="both", expand=True)
+        
+        self.text_scrollbar = ttk.Scrollbar(text_frame, command=self.text_widget.yview)
+        self.text_scrollbar.pack(side="right", fill="y")
+        self.text_widget.configure(yscrollcommand=self.text_scrollbar.set)
+        
+        self.answer_frame.grid()
+    
+    def _render_writing_practice(self, card: LessonCard) -> None:
+        """Render writing practice exercise with word count tracking."""
+        # Clear MC buttons if any
+        if hasattr(self, 'mc_buttons'):
+            for btn in self.mc_buttons:
+                btn.destroy()
+            self.mc_buttons = []
+        
+        # Hide other areas
+        self.responsive_image.grid_remove()
+        if self.audio_player:
+            self.audio_player.grid_remove()
+        if self.speech_recorder:
+            self.speech_recorder.grid_remove()
+        if self.word_order_widget:
+            self.word_order_widget.pack_forget()
+        
+        # Writing prompt
+        prompt_frame = ttk.LabelFrame(self.answer_frame, text="✍️ Writing Prompt", padding=10)
+        prompt_frame.pack(fill="x", pady=(0, 15))
+        
+        prompt_text = card.writing_prompt or card.question or "Write about a topic."
+        ttk.Label(
+            prompt_frame,
+            text=prompt_text,
+            font=("Helvetica", 12),
+            foreground="#e0e0e0",
+            wraplength=500,
+        ).pack(anchor="w")
+        
+        min_words = card.writing_min_words or 20
+        max_words = card.writing_max_words or 100
+        
+        ttk.Label(
+            prompt_frame,
+            text=f"📝 Write {min_words}-{max_words} words",
+            font=("Helvetica", 10),
+            foreground="#a0a0a0",
+        ).pack(anchor="w", pady=(5, 0))
+        
+        # Writing area
+        write_label = ttk.Label(
+            self.answer_frame,
+            text="Your Writing:",
+            font=("Helvetica", 11),
+            foreground="#7bb3ff",
+        )
+        write_label.pack(anchor="w", pady=(10, 5))
+        
+        text_frame = ttk.Frame(self.answer_frame)
+        text_frame.pack(fill="x", pady=(0, 5))
+        
+        self.text_widget = tk.Text(
+            text_frame,
+            wrap="word",
+            height=8,
+            width=50,
+            font=("Helvetica", 12),
+            bg="#1e1e1e",
+            fg="#ffffff",
+            insertbackground="#ffffff",
+            relief="flat",
+            padx=10,
+            pady=10,
+        )
+        self.text_widget.pack(side="left", fill="both", expand=True)
+        
+        self.text_scrollbar = ttk.Scrollbar(text_frame, command=self.text_widget.yview)
+        self.text_scrollbar.pack(side="right", fill="y")
+        self.text_widget.configure(yscrollcommand=self.text_scrollbar.set)
+        
+        # Word count label
+        self.word_count_label = ttk.Label(
+            self.answer_frame,
+            text=f"Words: 0 (target: {min_words}-{max_words})",
+            font=("Helvetica", 10),
+            foreground="#a0a0a0",
+        )
+        self.word_count_label.pack(anchor="e", pady=(0, 10))
+        
+        # Update word count on key release
+        def update_word_count(*args):
+            text = self.text_widget.get("1.0", tk.END).strip()
+            count = len(text.split()) if text else 0
+            if count < min_words:
+                color = "#ff6b6b"
+            elif count > max_words:
+                color = "#ffa94d"
+            else:
+                color = "#69db7c"
+            self.word_count_label.configure(
+                text=f"Words: {count} (target: {min_words}-{max_words})",
+                foreground=color,
+            )
+        
+        self.text_widget.bind("<KeyRelease>", update_word_count)
+        self.answer_frame.grid()
+    
+    def _render_word_order(self, card: LessonCard) -> None:
+        """Render word ordering exercise (Duolingo-style sentence building)."""
+        # Clear MC buttons if any
+        if hasattr(self, 'mc_buttons'):
+            for btn in self.mc_buttons:
+                btn.destroy()
+            self.mc_buttons = []
+        
+        # Hide other areas
+        self.responsive_image.grid_remove()
+        if self.audio_player:
+            self.audio_player.grid_remove()
+        if self.speech_recorder:
+            self.speech_recorder.grid_remove()
+        
+        # Create word order widget if needed
+        if not self.word_order_widget:
+            self.word_order_widget = WordOrderWidget(
+                self.answer_frame,
+                on_answer_ready=self._on_word_order_answer_changed,
+            )
+        
+        # Clear any existing text widget
+        if hasattr(self, 'text_widget') and self.text_widget:
+            self.text_widget.pack_forget()
+        
+        # Set up the exercise
+        scrambled = card.scrambled_words or []
+        source = card.source_sentence or card.question or ""
+        distractors = card.distractor_words or []
+        
+        if not scrambled and card.correct_word_order:
+            # Scramble the correct order if not provided
+            import random
+            scrambled = list(card.correct_word_order)
+            random.shuffle(scrambled)
+        
+        self.word_order_widget.set_words(scrambled, source, distractors)
+        self.word_order_widget.pack(fill="x", pady=(10, 10))
+        
+        # Reset answer
+        self.current_word_order_answer = ""
+        
+        self.answer_frame.grid()
+    
+    def _on_word_order_answer_changed(self, answer: str) -> None:
+        """Called when user changes word order selection."""
+        self.current_word_order_answer = answer
+    
     def _show_skip_feedback(self, message: str, card: LessonCard) -> None:
         """Show brief feedback for skipped exercises and move to next card."""
         # Create a simple feedback display - skipped cards are not penalized
@@ -4041,7 +4725,7 @@ class LessonCardView(ttk.Frame):
             
             self.text_widget = tk.Text(
                 text_frame, 
-                height=6,
+                height=6, 
                 width=60,  # Fixed width for consistent centering
                 wrap="word",
                 bg="#2d2d2d",  # Dark background
@@ -4064,9 +4748,38 @@ class LessonCardView(ttk.Frame):
         """Clear all card rendering widgets."""
         self.answer_frame.grid_remove()
         
+        # Clean up word order widget BEFORE destroying answer_frame children
+        # (it may be a child of answer_frame and would be destroyed)
+        if self.word_order_widget:
+            try:
+                self.word_order_widget.pack_forget()
+            except tk.TclError:
+                pass  # Widget already destroyed
+            self.word_order_widget = None  # Will be recreated if needed
+        self.current_word_order_answer = ""
+        
+        # Clean up audio player BEFORE destroying children
+        if self.audio_player:
+            try:
+                self.audio_player.stop()
+                self.audio_player.grid_remove()
+            except tk.TclError:
+                pass  # Widget already destroyed
+        
+        # Clean up speech recorder BEFORE destroying children
+        if self.speech_recorder:
+            try:
+                self.speech_recorder.grid_remove()
+            except tk.TclError:
+                pass  # Widget already destroyed
+        self.current_transcription = None
+        
         # Destroy ALL children of answer_frame to prevent layout issues
         for child in self.answer_frame.winfo_children():
-            child.destroy()
+            try:
+                child.destroy()
+            except tk.TclError:
+                pass  # Already destroyed
         
         # Reset widget references
         self.mc_buttons = []
@@ -4074,17 +4787,6 @@ class LessonCardView(ttk.Frame):
         self.text_scrollbar = None
         if hasattr(self, 'vocab_label'):
             self.vocab_label = None
-        
-        # Clean up audio player (now in content frame)
-        if self.audio_player:
-            self.audio_player.stop()
-            self.audio_player.grid_remove()
-        
-        # Clean up speech recorder
-        if self.speech_recorder:
-            self.speech_recorder.reset()
-            self.speech_recorder.grid_remove()
-        self.current_transcription = None
     
     def _on_mc_selected(self, index: int) -> None:
         """Handle multiple choice selection - buttons stay depressed (radio button style)."""
@@ -4200,6 +4902,36 @@ class LessonCardView(ttk.Frame):
                 messagebox.showinfo("Record your speech", "Please record yourself saying the phrase first.")
                 return
             response = self.current_transcription
+        elif card.type == "reading_comprehension":
+            # Reading comprehension uses text widget
+            if not hasattr(self, 'text_widget') or not self.text_widget:
+                messagebox.showinfo("Enter an answer", "Please answer the comprehension questions.")
+                return
+            response = self.text_widget.get("1.0", tk.END).strip()
+        elif card.type == "writing_practice":
+            # Writing practice uses text widget with word count validation
+            if not hasattr(self, 'text_widget') or not self.text_widget:
+                messagebox.showinfo("Enter your writing", "Please write your response.")
+                return
+            response = self.text_widget.get("1.0", tk.END).strip()
+            # Check minimum word count
+            word_count = len(response.split()) if response else 0
+            min_words = card.writing_min_words or 20
+            if word_count < min_words:
+                messagebox.showinfo(
+                    "More writing needed", 
+                    f"Please write at least {min_words} words. You have {word_count} so far."
+                )
+                return
+        elif card.type == "word_order":
+            # Word order uses the word order widget
+            if not self.current_word_order_answer:
+                messagebox.showinfo("Build a sentence", "Please click words to build your sentence.")
+                return
+            response = self.current_word_order_answer
+            # Store the word list in the card for evaluation
+            if self.word_order_widget:
+                card.user_word_order = self.word_order_widget.get_word_list()
         else:
             if not hasattr(self, 'text_widget') or not self.text_widget:
                 messagebox.showinfo("Enter an answer", "Please enter your answer.")

@@ -74,6 +74,7 @@ class VocabularyItem:
     """
     A single vocabulary word being tracked.
     Strength is calculated from encounter history.
+    Includes spaced repetition scheduling.
     """
     word: str                          # Word in target language
     translation: str                   # English translation
@@ -93,6 +94,12 @@ class VocabularyItem:
     last_seen: Optional[str] = None    # ISO timestamp
     last_correct: Optional[str] = None # ISO timestamp
     last_incorrect: Optional[str] = None
+    
+    # Spaced Repetition fields
+    next_review: Optional[str] = None  # ISO date when next review is due
+    review_interval_days: int = 1      # Current interval between reviews
+    ease_factor: float = 2.5           # Multiplier for interval (SM-2 algorithm)
+    consecutive_correct: int = 0       # Consecutive correct answers (resets on error)
     
     # Context and examples
     example_sentences: List[str] = field(default_factory=list)
@@ -142,20 +149,45 @@ class VocabularyItem:
             self.strength_rating = StrengthRating.NEW.value
     
     def record_encounter(self, correct: bool, card_type: str = "", example: str = "") -> None:
-        """Record a new encounter with this word."""
-        now = datetime.now(timezone.utc).isoformat()
+        """Record a new encounter with this word and update spaced repetition schedule."""
+        now = datetime.now(timezone.utc)
+        now_str = now.isoformat()
         
         self.times_seen += 1
         if correct:
             self.times_correct += 1
-            self.last_correct = now
+            self.last_correct = now_str
+            self.consecutive_correct += 1
+            
+            # Spaced Repetition: Increase interval on correct answer (SM-2 inspired)
+            if self.consecutive_correct == 1:
+                self.review_interval_days = 1
+            elif self.consecutive_correct == 2:
+                self.review_interval_days = 3
+            else:
+                # Apply ease factor for subsequent reviews
+                self.review_interval_days = int(self.review_interval_days * self.ease_factor)
+                self.review_interval_days = min(self.review_interval_days, 180)  # Cap at 6 months
+            
+            # Increase ease factor slightly for correct answers
+            self.ease_factor = min(3.0, self.ease_factor + 0.1)
         else:
             self.times_incorrect += 1
-            self.last_incorrect = now
+            self.last_incorrect = now_str
+            self.consecutive_correct = 0  # Reset streak
+            
+            # Spaced Repetition: Reset interval on incorrect answer
+            self.review_interval_days = 1
+            # Decrease ease factor on errors
+            self.ease_factor = max(1.3, self.ease_factor - 0.2)
         
-        self.last_seen = now
+        # Calculate next review date
+        next_review_date = now + timedelta(days=self.review_interval_days)
+        self.next_review = next_review_date.date().isoformat()
+        
+        self.last_seen = now_str
         if not self.first_seen:
-            self.first_seen = now
+            self.first_seen = now_str
         
         if card_type and card_type not in self.card_types_seen:
             self.card_types_seen.append(card_type)
@@ -166,6 +198,17 @@ class VocabularyItem:
             self.example_sentences = self.example_sentences[-5:]
         
         self.calculate_strength()
+    
+    def is_due_for_review(self) -> bool:
+        """Check if this word is due for review based on spaced repetition."""
+        if not self.next_review:
+            return True  # Never reviewed, always due
+        
+        try:
+            next_date = datetime.fromisoformat(self.next_review).date()
+            return datetime.now(timezone.utc).date() >= next_date
+        except Exception:
+            return True
     
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -245,6 +288,72 @@ class GrammarPattern:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GrammarPattern":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class ErrorPattern:
+    """
+    Tracks specific error patterns the learner makes repeatedly.
+    Used to generate targeted practice and feedback.
+    """
+    error_id: str                      # Unique identifier
+    language: str                      # Target language
+    error_type: str                    # Category: "gender", "verb_conjugation", "word_order", "spelling", etc.
+    description: str = ""              # Human-readable description
+    
+    # Specific details
+    incorrect_form: str = ""           # What the user wrote
+    correct_form: str = ""             # What it should have been
+    context: str = ""                  # Sentence/question context
+    
+    # Tracking
+    occurrence_count: int = 1          # How many times this error occurred
+    first_seen: Optional[str] = None   # ISO timestamp
+    last_seen: Optional[str] = None    # ISO timestamp
+    
+    # Examples of this error
+    examples: List[Dict[str, str]] = field(default_factory=list)  # [{"incorrect": "...", "correct": "...", "context": "..."}]
+    
+    # Has user shown improvement?
+    times_corrected: int = 0           # Times user got it right after making this error
+    is_resolved: bool = False          # True if user consistently gets it right now
+    
+    def record_occurrence(self, incorrect: str, correct: str, context: str = "") -> None:
+        """Record another occurrence of this error."""
+        now = datetime.now(timezone.utc).isoformat()
+        
+        self.occurrence_count += 1
+        self.last_seen = now
+        if not self.first_seen:
+            self.first_seen = now
+        
+        self.incorrect_form = incorrect
+        self.correct_form = correct
+        if context:
+            self.context = context
+        
+        # Add to examples (keep last 5)
+        self.examples.append({
+            "incorrect": incorrect,
+            "correct": correct,
+            "context": context,
+            "timestamp": now
+        })
+        self.examples = self.examples[-5:]
+    
+    def record_correction(self) -> None:
+        """Record that user got this pattern correct."""
+        self.times_corrected += 1
+        # Mark as resolved if corrected 3+ times consecutively
+        if self.times_corrected >= 3:
+            self.is_resolved = True
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ErrorPattern":
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
@@ -677,6 +786,159 @@ class DatabaseClient:
         weak.sort(key=lambda v: v.strength_score)
         return weak[:limit]
     
+    def get_vocabulary_due_for_review(
+        self,
+        language: str,
+        user_id: Optional[str] = None,
+        limit: int = 20
+    ) -> List[VocabularyItem]:
+        """
+        Get vocabulary items due for review based on spaced repetition scheduling.
+        Returns words where next_review date is today or earlier.
+        """
+        uid = user_id or self._user_id
+        
+        all_vocab = self.get_all_vocabulary(language, uid)
+        today = datetime.now(timezone.utc).date()
+        
+        due_words = []
+        for vocab in all_vocab:
+            if vocab.is_due_for_review():
+                due_words.append(vocab)
+        
+        # Sort by priority: oldest due first, then by strength (weaker first)
+        def review_priority(v: VocabularyItem) -> tuple:
+            try:
+                if v.next_review:
+                    days_overdue = (today - datetime.fromisoformat(v.next_review).date()).days
+                else:
+                    days_overdue = 999  # Never reviewed, high priority
+            except Exception:
+                days_overdue = 999
+            return (-days_overdue, v.strength_score)  # Negative for descending order
+        
+        due_words.sort(key=review_priority)
+        logger.debug(f"[DB] Found {len(due_words)} words due for review in {language}")
+        return due_words[:limit]
+    
+    # ---------------------------------------------------------------------------
+    # Error Pattern Operations
+    # ---------------------------------------------------------------------------
+    
+    def _error_hash(self, error_type: str, incorrect: str, language: str) -> str:
+        """Generate a unique hash for an error pattern."""
+        import hashlib
+        key = f"{language}:{error_type}:{incorrect.lower()}"
+        return hashlib.md5(key.encode()).hexdigest()[:12]
+    
+    def get_error_pattern(
+        self,
+        error_type: str,
+        incorrect_form: str,
+        language: str,
+        user_id: Optional[str] = None
+    ) -> Optional[ErrorPattern]:
+        """Get a specific error pattern if it exists."""
+        uid = user_id or self._user_id
+        error_id = self._error_hash(error_type, incorrect_form, language)
+        cache_key = f"{uid}_error_{error_id}"
+        
+        if not self.is_connected():
+            return ErrorPattern.from_dict(self._cache[cache_key]) if cache_key in self._cache else None
+        
+        try:
+            doc = self.db.collection("users").document(uid)\
+                        .collection("errors").document(error_id).get()
+            if doc.exists:
+                return ErrorPattern.from_dict(doc.to_dict())
+            return None
+        except Exception as e:
+            logger.error(f"Error getting error pattern: {e}")
+            return None
+    
+    def save_error_pattern(
+        self,
+        error_type: str,
+        incorrect_form: str,
+        correct_form: str,
+        language: str,
+        context: str = "",
+        user_id: Optional[str] = None
+    ) -> Optional[ErrorPattern]:
+        """Save or update an error pattern."""
+        uid = user_id or self._user_id
+        error_id = self._error_hash(error_type, incorrect_form, language)
+        
+        # Check if pattern exists
+        existing = self.get_error_pattern(error_type, incorrect_form, language, uid)
+        
+        if existing:
+            existing.record_occurrence(incorrect_form, correct_form, context)
+            pattern = existing
+        else:
+            pattern = ErrorPattern(
+                error_id=error_id,
+                language=language,
+                error_type=error_type,
+                incorrect_form=incorrect_form,
+                correct_form=correct_form,
+                context=context,
+                first_seen=datetime.now(timezone.utc).isoformat(),
+                last_seen=datetime.now(timezone.utc).isoformat(),
+            )
+        
+        cache_key = f"{uid}_error_{error_id}"
+        
+        if not self.is_connected():
+            self._cache[cache_key] = pattern.to_dict()
+            return pattern
+        
+        try:
+            self.db.collection("users").document(uid)\
+                  .collection("errors").document(error_id).set(pattern.to_dict())
+            logger.debug(f"[DB] Saved error pattern: {error_type} - '{incorrect_form}'")
+            return pattern
+        except Exception as e:
+            logger.error(f"Error saving error pattern: {e}")
+            return None
+    
+    def get_frequent_errors(
+        self,
+        language: str,
+        user_id: Optional[str] = None,
+        min_occurrences: int = 2,
+        limit: int = 10
+    ) -> List[ErrorPattern]:
+        """Get the most frequent unresolved error patterns."""
+        uid = user_id or self._user_id
+        
+        if not self.is_connected():
+            errors = []
+            for key, value in self._cache.items():
+                if key.startswith(f"{uid}_error_"):
+                    pattern = ErrorPattern.from_dict(value)
+                    if pattern.language == language and not pattern.is_resolved:
+                        if pattern.occurrence_count >= min_occurrences:
+                            errors.append(pattern)
+            errors.sort(key=lambda e: e.occurrence_count, reverse=True)
+            return errors[:limit]
+        
+        try:
+            docs = self.db.collection("users").document(uid)\
+                         .collection("errors")\
+                         .where("language", "==", language)\
+                         .where("is_resolved", "==", False)\
+                         .stream()
+            
+            errors = [ErrorPattern.from_dict(doc.to_dict()) for doc in docs]
+            errors = [e for e in errors if e.occurrence_count >= min_occurrences]
+            errors.sort(key=lambda e: e.occurrence_count, reverse=True)
+            logger.debug(f"[DB] Found {len(errors)} frequent errors in {language}")
+            return errors[:limit]
+        except Exception as e:
+            logger.error(f"Error getting frequent errors: {e}")
+            return []
+    
     def delete_language_progress(
         self,
         language: str,
@@ -1006,6 +1268,12 @@ class DatabaseClient:
         # ALL known words (for avoiding duplicates in new lessons)
         all_known_words = [v.word for v in all_vocab if v.word]
         
+        # Get words due for review (spaced repetition)
+        due_for_review = self.get_vocabulary_due_for_review(language, uid, limit=20)
+        
+        # Get frequent error patterns
+        frequent_errors = self.get_frequent_errors(language, uid, min_occurrences=2, limit=10)
+        
         # Vocabulary summary
         vocab_summary = {
             "total_words_learned": len(all_vocab),
@@ -1016,7 +1284,25 @@ class DatabaseClient:
                 {"word": v.word, "translation": v.translation, "strength": v.strength_score}
                 for v in weak_vocab[:10]
             ],
+            "due_for_review": [
+                {"word": v.word, "translation": v.translation, "days_overdue": v.review_interval_days}
+                for v in due_for_review[:10]
+            ],
             "all_known_words": all_known_words,  # ALL words learned (for avoiding duplicates)
+        }
+        
+        # Error patterns summary
+        error_summary = {
+            "frequent_errors": [
+                {
+                    "error_type": e.error_type,
+                    "incorrect": e.incorrect_form,
+                    "correct": e.correct_form,
+                    "occurrences": e.occurrence_count,
+                    "context": e.context
+                }
+                for e in frequent_errors
+            ]
         }
         
         # Recent sessions summary
@@ -1051,6 +1337,7 @@ class DatabaseClient:
             "weaknesses": lang_profile.weaknesses if lang_profile else [],
             "recommendations": lang_profile.recommendations if lang_profile else [],
             "vocabulary": vocab_summary,
+            "errors": error_summary,
             "sessions": session_summary,
             "learning_goals": lang_profile.current_goals if lang_profile else [],
         }
@@ -1095,10 +1382,30 @@ class DatabaseClient:
             f"  - Strong: {context['vocabulary']['strong_count']}",
             f"  - Learning: {context['vocabulary']['learning_count']}",
             "",
-            "WORDS NEEDING PRACTICE (prioritize these in review):",
+            "WORDS NEEDING PRACTICE (weak vocabulary):",
         ])
         for v in context['vocabulary']['weak_words_needing_practice'][:10]:
             lines.append(f"  - {v['word']} ({v['translation']}) - strength: {v['strength']}/100")
+        
+        # Add words due for spaced repetition review
+        due_for_review = context['vocabulary'].get('due_for_review', [])
+        if due_for_review:
+            lines.extend([
+                "",
+                "WORDS DUE FOR REVIEW (spaced repetition - INCLUDE THESE):",
+            ])
+            for v in due_for_review[:10]:
+                lines.append(f"  - {v['word']} ({v['translation']})")
+        
+        # Add error patterns to target
+        frequent_errors = context.get('errors', {}).get('frequent_errors', [])
+        if frequent_errors:
+            lines.extend([
+                "",
+                "FREQUENT ERRORS - CREATE EXERCISES TARGETING THESE:",
+            ])
+            for e in frequent_errors[:5]:
+                lines.append(f"  - {e['error_type']}: '{e['incorrect']}' → '{e['correct']}' ({e['occurrences']}x)")
         
         # Add ALL known words to AVOID for new vocabulary
         all_known_words = context['vocabulary'].get('all_known_words', [])

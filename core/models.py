@@ -38,12 +38,13 @@ class LessonCard:
     type: Literal[
         "text_question", "multiple_choice", "image_question", 
         "fill_in_blank", "vocabulary", "audio_transcription", "audio_comprehension",
-        "speaking"
+        "speaking", "reading_comprehension", "writing_practice", "word_order"
     ]
     question: Optional[str] = None          # Question text (for question types)
     instruction: Optional[str] = None       # Optional instruction in English
     image_prompt: Optional[str] = None      # Prompt for image generation
     image_path: Optional[str] = None        # Path to generated image (filled by client)
+    difficulty_level: str = "A1"            # CEFR level of this card
     
     # For text_question, fill_in_blank, image_question
     correct_answer: Optional[str] = None
@@ -69,6 +70,24 @@ class LessonCard:
     user_recording_path: Optional[str] = None  # Path to user's recorded audio
     user_transcription: Optional[str] = None   # STT result of user's speech
     
+    # For reading_comprehension
+    reading_passage: Optional[str] = None   # The passage to read (in target language)
+    reading_translation: Optional[str] = None  # English translation (shown after)
+    reading_questions: List[Dict[str, Any]] = field(default_factory=list)  # Questions about the passage
+    vocabulary_highlights: List[Dict[str, str]] = field(default_factory=list)  # Key vocab from passage
+    
+    # For writing_practice
+    writing_prompt: Optional[str] = None    # What to write about
+    writing_min_words: int = 20             # Minimum word count
+    writing_max_words: int = 100            # Maximum word count
+    writing_feedback: Optional[Dict[str, Any]] = None  # Detailed feedback from LLM
+    
+    # For word_order (Duolingo-style sentence building)
+    scrambled_words: List[str] = field(default_factory=list)  # Words in random order
+    correct_word_order: List[str] = field(default_factory=list)  # Words in correct order
+    distractor_words: List[str] = field(default_factory=list)  # Extra wrong words (optional)
+    source_sentence: Optional[str] = None   # Original sentence (e.g., English to translate)
+    
     # Feedback and vocabulary expansion
     feedback: Optional[str] = None          # Feedback shown after submission
     vocabulary_expansion: List[str] = field(default_factory=list)  # Additional vocabulary
@@ -76,9 +95,13 @@ class LessonCard:
     # User response tracking
     user_response: Optional[str] = None
     user_answer_index: Optional[int] = None
+    user_word_order: List[str] = field(default_factory=list)  # User's word ordering attempt
     is_correct: Optional[bool] = None
     card_score: int = 0                     # Score for this specific card (0-100)
     skipped: bool = False                   # True if user skipped this card (not penalized)
+    
+    # Error tracking (for error pattern analysis)
+    error_types: List[str] = field(default_factory=list)  # Types of errors made on this card
 
 
 @dataclass

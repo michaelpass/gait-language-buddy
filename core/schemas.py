@@ -23,7 +23,7 @@ The lesson card JSON structure supports the following card types:
 2. "multiple_choice" - Multiple choice question
    {
      "type": "multiple_choice",
-     "question": "Question text in target language",
+     "question": "REQUIRED: Clear question like 'What is the German word for apple?'",
      "instruction": "Optional instruction in English",
      "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
      "correct_index": 0,  // Index of correct option (0-based)
@@ -31,8 +31,13 @@ The lesson card JSON structure supports the following card types:
      "feedback": "Feedback shown after submission",
      "vocabulary_expansion": ["Additional vocabulary word 1", "Word 2"]
    }
-   IMPORTANT: Do NOT include letter prefixes (A, B, C, D) or numbers in the option text.
-   The UI will automatically add "A. ", "B. ", etc. Just provide the plain option text.
+   🚨 CRITICAL: The "question" field is MANDATORY for multiple_choice cards!
+   🚨 Without a question, the user won't know what they're being asked.
+   🚨 Good examples:
+      - "What is the German word for 'chair'?"
+      - "Which word means 'to go' in German?"
+      - "Select the correct translation for 'der Hund'"
+   🚨 Do NOT include letter prefixes (A, B, C, D) in option text - UI adds these.
 
 3. "image_question" - "What is this?" style question with image
    {

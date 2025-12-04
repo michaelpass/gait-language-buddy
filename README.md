@@ -28,6 +28,9 @@ This application provides a comprehensive, multimodal language learning experien
 - **Audio Transcription** - Listen and write (TTS via OpenAI)
 - **Audio Comprehension** - Listen to passages and answer questions
 - **Speaking Exercises** - Record yourself and get STT feedback
+- **Reading Comprehension** - Read passages and answer questions
+- **Writing Practice** - Write original text with detailed feedback
+- **Word Ordering** - Build sentences from scrambled words (Duolingo-style)
 
 ### 🔊 Multimodal Learning
 - **Image Generation** - DALL-E 3 creates contextual images
@@ -39,6 +42,11 @@ This application provides a comprehensive, multimodal language learning experien
 - Grammar pattern progress
 - Session history
 - Personalized LLM context for evolving lessons
+
+### 🧠 Smart Learning Features (NEW)
+- **Spaced Repetition** - Words are scheduled for review based on memory strength
+- **Error Pattern Analysis** - Tracks your mistakes to generate targeted practice
+- **Writing Feedback** - Detailed grammar, vocabulary, and style analysis
 
 ---
 
@@ -191,7 +199,7 @@ service cloud.firestore {
 }
 ```
 
-### Vocabulary Item
+### Vocabulary Item (with Spaced Repetition)
 ```json
 {
   "word": "manzana",
@@ -200,7 +208,23 @@ service cloud.firestore {
   "times_correct": 6,
   "strength_score": 75,
   "strength_rating": "familiar",
-  "example_sentences": ["La manzana es roja."]
+  "example_sentences": ["La manzana es roja."],
+  "next_review": "2025-12-10",
+  "review_interval_days": 7,
+  "ease_factor": 2.5,
+  "consecutive_correct": 3
+}
+```
+
+### Error Pattern
+```json
+{
+  "error_type": "gender_agreement",
+  "incorrect_form": "la problema",
+  "correct_form": "el problema",
+  "occurrence_count": 3,
+  "context": "I have a problem",
+  "is_resolved": false
 }
 ```
 

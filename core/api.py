@@ -1497,9 +1497,126 @@ def _clean_option_text(option: str) -> str:
     return cleaned.strip()
 
 
+def _normalize_word(word: str, language: str = "") -> str:
+    """
+    Normalize a word for duplicate detection.
+    Strips articles, lowercases, removes extra whitespace.
+    """
+    if not word:
+        return ""
+    
+    word = word.lower().strip()
+    
+    # Remove common articles for various languages
+    articles = {
+        # German
+        "der ", "die ", "das ", "den ", "dem ", "des ",
+        "ein ", "eine ", "einen ", "einem ", "einer ", "eines ",
+        # Spanish
+        "el ", "la ", "los ", "las ", "un ", "una ", "unos ", "unas ",
+        # French
+        "le ", "la ", "les ", "l'", "un ", "une ", "des ",
+        # Italian
+        "il ", "lo ", "la ", "i ", "gli ", "le ", "un ", "uno ", "una ",
+        # Portuguese
+        "o ", "a ", "os ", "as ", "um ", "uma ", "uns ", "umas ",
+    }
+    
+    for article in articles:
+        if word.startswith(article):
+            word = word[len(article):]
+            break
+    
+    # Also handle articles at the end (for some display formats like "Apfel, der")
+    for article in [", der", ", die", ", das", ", el", ", la", ", le"]:
+        if word.endswith(article):
+            word = word[:-len(article)]
+            break
+    
+    return word.strip()
+
+
 def _json_to_lesson_card(card_data: Dict[str, Any]) -> LessonCard:
     """Convert JSON card data to LessonCard object."""
     card_type = card_data.get("type", "text_question")
+    question = card_data.get("question")
+    instruction = card_data.get("instruction")
+    correct_answer = card_data.get("correct_answer")
+    
+    # VALIDATION: Fix incomplete cards missing questions
+    
+    # For multiple_choice: MUST have a question
+    if card_type == "multiple_choice":
+        # Check if question is missing, empty, or just whitespace
+        question_missing = not question or not question.strip() or len(question.strip()) < 5
+        if question_missing:
+            options = card_data.get("options", [])
+            correct_idx = card_data.get("correct_index")
+            # Try to generate a meaningful question
+            if correct_answer:
+                question = f"Which option means '{correct_answer}'?"
+            elif correct_idx is not None and options and 0 <= correct_idx < len(options):
+                # Use the correct option to form a question
+                correct_option = options[correct_idx]
+                question = f"What does '{correct_option}' mean? Select the matching option."
+            elif options and len(options) > 0:
+                # Generic but descriptive question
+                question = f"Select the correct {card_data.get('word') or 'translation'} from the options below:"
+            else:
+                question = "Choose the correct option:"
+            logger.warning(f"Multiple choice card missing question - generated: '{question}'")
+    
+    # For fill_in_blank: MUST have a sentence with blank
+    elif card_type == "fill_in_blank":
+        if not question or "______" not in question:
+            logger.warning(f"Incomplete fill_in_blank card detected: question='{question}', instruction='{instruction}'")
+            if correct_answer:
+                question = f"______ ({instruction or 'Fill in the blank'}). Answer: {correct_answer}"
+                logger.warning(f"Reconstructed question: '{question}'")
+            else:
+                question = f"[INCOMPLETE CARD] {instruction or 'Fill in the blank with the correct word.'}"
+    
+    # For image_question: MUST have a question about the image
+    elif card_type == "image_question":
+        if not question or len(question.strip()) < 5:
+            question = "What is shown in this image?"
+            logger.warning(f"Image question card missing question - using default: '{question}'")
+    
+    # For text_question: MUST have a question
+    elif card_type == "text_question":
+        if not question or len(question.strip()) < 5:
+            if correct_answer:
+                question = f"Translate: {correct_answer}"
+            else:
+                question = instruction or "Answer the following:"
+            logger.warning(f"Text question card missing question - generated: '{question}'")
+    
+    # For audio_transcription: Generate question from instruction
+    elif card_type == "audio_transcription":
+        if not question:
+            question = instruction or "Listen and write what you hear."
+    
+    # For audio_comprehension: Must have a question about the audio
+    elif card_type == "audio_comprehension":
+        if not question or len(question.strip()) < 5:
+            question = "What did you hear in the audio?"
+            logger.warning(f"Audio comprehension card missing question - using default: '{question}'")
+    
+    # For speaking: Question should explain what to say
+    elif card_type == "speaking":
+        speaking_prompt = card_data.get("speaking_prompt")
+        if not question and speaking_prompt:
+            question = f"Say the following out loud: {speaking_prompt}"
+        elif not question:
+            question = instruction or "Say the phrase shown below:"
+    
+    # For word_order: Question should explain the task
+    elif card_type == "word_order":
+        source_sentence = card_data.get("source_sentence")
+        if not question and source_sentence:
+            question = f"Arrange the words to translate: {source_sentence}"
+        elif not question:
+            question = "Arrange the words in the correct order:"
     
     # Sanitize image prompt if present
     image_prompt = card_data.get("image_prompt")
@@ -1514,12 +1631,16 @@ def _json_to_lesson_card(card_data: Dict[str, Any]) -> LessonCard:
     # Handle comprehension questions for audio_comprehension cards
     comprehension_questions = card_data.get("comprehension_questions", []) or []
     
+    # Handle reading comprehension fields
+    reading_questions = card_data.get("reading_questions", []) or []
+    vocabulary_highlights = card_data.get("vocabulary_highlights", []) or []
+    
     return LessonCard(
         type=card_type,
-        question=card_data.get("question"),
-        instruction=card_data.get("instruction"),
+        question=question,  # Use validated question
+        instruction=instruction,
         image_prompt=image_prompt,
-        correct_answer=card_data.get("correct_answer"),
+        correct_answer=correct_answer,
         alternatives=card_data.get("alternatives", []) or [],
         options=options,
         correct_index=card_data.get("correct_index"),
@@ -1532,6 +1653,22 @@ def _json_to_lesson_card(card_data: Dict[str, Any]) -> LessonCard:
         speaking_prompt=card_data.get("speaking_prompt"),
         feedback=card_data.get("feedback"),
         vocabulary_expansion=card_data.get("vocabulary_expansion", []) or [],
+        # Reading comprehension fields
+        reading_passage=card_data.get("reading_passage"),
+        reading_translation=card_data.get("reading_translation"),
+        reading_questions=reading_questions,
+        vocabulary_highlights=vocabulary_highlights,
+        # Writing practice fields
+        writing_prompt=card_data.get("writing_prompt"),
+        writing_min_words=card_data.get("writing_min_words", 20),
+        writing_max_words=card_data.get("writing_max_words", 100),
+        # Word order fields (Duolingo-style sentence building)
+        scrambled_words=card_data.get("scrambled_words", []) or [],
+        correct_word_order=card_data.get("correct_word_order", []) or [],
+        distractor_words=card_data.get("distractor_words", []) or [],
+        source_sentence=card_data.get("source_sentence"),
+        # Difficulty level
+        difficulty_level=card_data.get("difficulty_level", "A1"),
     )
 
 
@@ -1611,56 +1748,104 @@ def generate_structured_lesson_plan(
         logger.warning("Using fallback lesson plan (no API)")
         return _structured_lesson_plan_fallback(assessment_result, language)
     
+    # Initialize word lists (used in user message)
+    all_words: List[str] = []
+    all_verbs: List[str] = []
+    
     # Build teaching content context if available
     teaching_context = ""
     if teaching_plan and teaching_plan.cards:
         taught_vocabulary = []
+        taught_verbs = []
         taught_grammar = []
         taught_phrases = []
         
         for card in teaching_plan.cards:
+            # Vocabulary cards (nouns, adjectives, etc.)
             if card.type == "vocabulary_intro" and card.word:
                 taught_vocabulary.append({
                     "word": card.word,
                     "translation": card.translation,
+                    "part_of_speech": card.part_of_speech or "unknown",
                     "example": card.example_sentence,
                     "is_new": card.is_new,
                 })
+            # Conjugation tables (VERBS - very important to test!)
+            elif card.type == "conjugation_table" and card.infinitive:
+                taught_verbs.append({
+                    "verb": card.infinitive,
+                    "translation": card.translation,
+                    "tense": card.tense or "Present",
+                    "conjugations": card.conjugations,
+                    "examples": card.conjugation_examples[:2] if card.conjugation_examples else [],
+                })
+            # Grammar lessons
             elif card.type == "grammar_lesson" and card.grammar_rule:
                 taught_grammar.append({
                     "rule": card.grammar_rule,
                     "explanation": card.explanation[:200] if card.explanation else "",
                 })
+            # Phrases
             elif card.type == "phrase_lesson" and card.word:
                 taught_phrases.append({
                     "phrase": card.word,
                     "translation": card.translation,
                     "usage": card.explanation[:100] if card.explanation else "",
                 })
+            # Concept review (repeat of known vocab)
+            elif card.type == "concept_review" and card.word:
+                taught_vocabulary.append({
+                    "word": card.word,
+                    "translation": card.translation,
+                    "part_of_speech": card.part_of_speech or "unknown",
+                    "example": card.example_sentence,
+                    "is_new": False,  # Review word
+                })
+        
+        # Build explicit word list for emphasis
+        all_words = [v["word"] for v in taught_vocabulary if v.get("word")]
+        all_verbs = [v["verb"] for v in taught_verbs if v.get("verb")]
+        
+        # Debug logging for quiz generation
+        logger.debug(f"Quiz will test vocabulary: {all_words[:10]}...")
+        logger.debug(f"Quiz will test verbs: {all_verbs[:5]}...")
+        logger.debug(f"Teaching cards breakdown: {len(taught_vocabulary)} vocab, {len(taught_verbs)} verbs, {len(taught_grammar)} grammar, {len(taught_phrases)} phrases")
         
         teaching_context = f"""
-═══════════════════════════════════════════════════════════════════
-VOCABULARY & CONCEPTS TAUGHT THIS SESSION (TEST THESE!)
-═══════════════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════════════════════
+🎯 VOCABULARY & CONCEPTS TAUGHT THIS SESSION - QUIZ MUST TEST THESE! 🎯
+═══════════════════════════════════════════════════════════════════════════════
 
 Theme: {teaching_plan.theme or 'General'}
 New words introduced: {teaching_plan.new_words_count}
 Review words: {teaching_plan.review_words_count}
 
-VOCABULARY TO TEST (the user just learned these):
+📚 EXACT WORDS TO TEST (vocabulary - test at least 5 of these):
+{', '.join(all_words) if all_words else '(none)'}
+
 {json.dumps(taught_vocabulary, ensure_ascii=False, indent=2)}
 
-GRAMMAR CONCEPTS TO TEST:
+📝 EXACT VERBS TO TEST (with conjugations - test at least 3 of these):
+{', '.join(all_verbs) if all_verbs else '(none)'}
+
+{json.dumps(taught_verbs, ensure_ascii=False, indent=2)}
+
+📖 GRAMMAR CONCEPTS TO TEST:
 {json.dumps(taught_grammar, ensure_ascii=False, indent=2)}
 
-PHRASES TO TEST:
+💬 PHRASES TO TEST:
 {json.dumps(taught_phrases, ensure_ascii=False, indent=2)}
 
-CRITICAL: At least 70% of quiz questions should test the vocabulary and grammar 
-concepts listed above. The user JUST learned these, so the quiz should reinforce them.
-═══════════════════════════════════════════════════════════════════
+🚨🚨🚨 CRITICAL REQUIREMENTS 🚨🚨🚨
+1. At LEAST 70% of quiz questions MUST test words from the lists above
+2. For VERBS: Test conjugation (fill_in_blank) using the exact conjugations shown
+3. For VOCABULARY: Use multiple_choice, image_question, or fill_in_blank
+4. Do NOT invent new vocabulary - USE THE WORDS LISTED ABOVE
+5. The user JUST learned these - this quiz reinforces their learning!
+═══════════════════════════════════════════════════════════════════════════════
 """
-        logger.debug(f"Teaching context: {len(taught_vocabulary)} vocab, {len(taught_grammar)} grammar, {len(taught_phrases)} phrases")
+        logger.debug(f"Teaching context: {len(taught_vocabulary)} vocab, {len(taught_verbs)} verbs, {len(taught_grammar)} grammar, {len(taught_phrases)} phrases")
+        logger.debug(f"Words to test: {all_words[:10]}... Verbs: {all_verbs[:5]}...")
     
     try:
         messages = [
@@ -1677,12 +1862,20 @@ concepts listed above. The user JUST learned these, so the quiz should reinforce
                     '  "lesson_cards": [\n'
                     "    {\n"
                     '      "type": "multiple_choice",\n'
-                    '      "question": "...",\n'
-                    '      "options": ["Option text only, no A/B/C prefixes"],\n'
+                    '      "question": "What is the German word for apple?",\n'
+                    '      "options": ["Apfel", "Birne", "Orange", "Banane"],\n'
                     '      "correct_index": 0,\n'
-                    '      "image_prompt": "...",\n'
-                    '      "feedback": "...",\n'
-                    '      "vocabulary_expansion": [...]\n'
+                    '      "feedback": "Correct! Apfel means apple.",\n'
+                    '      "vocabulary_expansion": ["der Apfel", "die Birne"]\n'
+                    "    },\n"
+                    "    {\n"
+                    '      "type": "fill_in_blank",\n'
+                    '      "question": "Ich ______ müde. (I am tired.)",\n'
+                    '      "instruction": "Fill in the verb to be",\n'
+                    '      "correct_answer": "bin",\n'
+                    '      "alternatives": ["bin"],\n'
+                    '      "feedback": "Correct! bin is the first person form of sein.",\n'
+                    '      "vocabulary_expansion": ["sein", "müde"]\n'
                     "    },\n"
                     "    ... (12 cards total)\n"
                     "  ]\n"
@@ -1691,27 +1884,68 @@ concepts listed above. The user JUST learned these, so the quiz should reinforce
                     "- Create exactly 12 quiz cards\n"
                     "- **CRITICAL**: At least 8-10 cards should test vocabulary/grammar from the TEACHING CONTENT below\n"
                     "- The remaining 2-4 cards can test general knowledge at the learner's level\n"
-                    "- Use a mix of card types: multiple_choice, fill_in_blank, image_question, text_question, audio_transcription, audio_comprehension, speaking\n"
-                    "- Include image_prompts for visual cards (at least 5 out of 12)\n"
-                    "- IMPORTANT: Include 2-3 AUDIO cards (audio_transcription or audio_comprehension) to develop listening skills\n"
-                    "- IMPORTANT: Include 1-2 SPEAKING cards where the user speaks a phrase and it's transcribed\n"
+                    "- Use a mix of card types - REQUIRED DISTRIBUTION:\n"
+                    "  • 2-3 multiple_choice - vocabulary/translation questions\n"
+                    "  • 2-3 fill_in_blank - grammar/conjugation practice\n"
+                    "  • 2-3 image_question - visual vocabulary (MUST have image_prompt)\n"
+                    "  • 1-2 audio_transcription - listen and write (TTS cards)\n"
+                    "  • 1 audio_comprehension - listen to passage and answer\n"
+                    "  • 1-2 speaking - say phrase out loud (STT cards)\n"
+                    "  • 1 word_order - arrange scrambled words to form sentence\n"
+                    "  • 0-1 reading_comprehension - read passage, answer questions\n"
+                    "  • 0-1 writing_practice - free writing with feedback\n"
+                    "- TOTAL: Exactly 12 cards\n\n"
+                    "MULTIMEDIA REQUIREMENTS:\n"
+                    "- Include image_prompts for at least 5 cards (image_question, multiple_choice, etc.)\n"
+                    "- Audio cards (audio_transcription, audio_comprehension) need audio_text field\n"
+                    "- Speaking cards need speaking_prompt field\n"
+                    "- Word order cards need source_sentence, correct_word_order, scrambled_words\n"
                     "- Target the learner's proficiency level\n"
-                    "- Each card should have feedback and vocabulary_expansion\n"
-                    "- Vary question formats but keep testing the TAUGHT vocabulary\n\n"
-                    "**CRITICAL - EVERY CARD MUST BE TESTABLE**:\n"
-                    "- EVERY card MUST have a clear question that requires the user to provide an answer\n"
-                    "- Do NOT create cards that just display information (those are teaching cards, not quiz cards)\n"
-                    "- Do NOT use 'vocabulary' type for quiz cards - use multiple_choice, fill_in_blank, or text_question instead\n"
-                    "- Each card must have: a question/prompt, a correct_answer, and a way for the user to respond\n"
-                    "- Examples of GOOD quiz cards:\n"
-                    "  - multiple_choice: 'What is the German word for apple?' with options\n"
-                    "  - fill_in_blank: 'Ich ___ müde.' (correct_answer: 'bin')\n"
-                    "  - text_question: 'Translate: The house is big' (correct_answer: 'Das Haus ist groß')\n"
-                    "  - image_question: Show an image, ask 'What is this in German?'\n"
-                    "- Examples of BAD quiz cards (DO NOT DO):\n"
-                    "  - Just showing a word and translation (that's teaching, not testing)\n"
-                    "  - Cards without a question field\n"
-                    "  - Cards where the user doesn't need to respond\n\n"
+                    "- Each card should have feedback and vocabulary_expansion\n\n"
+                    "🚨🚨🚨 CRITICAL - QUESTION FIELD IS MANDATORY 🚨🚨🚨\n"
+                    "EVERY card MUST have a non-empty 'question' field that tells the user what to do!\n\n"
+                    "✅ GOOD multiple_choice example:\n"
+                    "{\n"
+                    '  "type": "multiple_choice",\n'
+                    '  "question": "What is the German word for \'table\'?",\n'
+                    '  "options": ["Stuhl", "Tisch", "Lampe", "Freund"],\n'
+                    '  "correct_index": 1,\n'
+                    '  "feedback": "Tisch means table!"\n'
+                    "}\n\n"
+                    "❌ BAD example (NEVER DO THIS):\n"
+                    "{\n"
+                    '  "type": "multiple_choice",\n'
+                    '  "question": "",  // EMPTY - USER WON\'T KNOW WHAT TO DO!\n'
+                    '  "options": ["Stuhl", "Tisch", "Lampe", "Freund"]\n'
+                    "}\n\n"
+                    "OTHER RULES:\n"
+                    "- Do NOT create cards that just display information\n"
+                    "- Do NOT use 'vocabulary' type for quiz cards\n"
+                    "- Each card must have: question, correct_answer, and a way to respond\n\n"
+                    "**FILL_IN_BLANK REQUIREMENTS** (CRITICAL - MUST INCLUDE SENTENCE):\n"
+                    "- The 'question' field MUST contain the COMPLETE SENTENCE with a blank (______)\n"
+                    "- Format: 'SENTENCE WITH ______ BLANK. (English translation)'\n"
+                    f"- Example for German: question='Ich ______ müde. (I am tired.)'\n"
+                    f"- Example for Spanish: question='Yo ______ estudiante. (I am a student.)'\n"
+                    "- The blank should be represented as ______ (6 underscores)\n"
+                    "- correct_answer: The word that fills the blank\n"
+                    "- instruction: Brief hint like 'Fill in the correct verb form'\n"
+                    "- NEVER create a fill_in_blank card with just an instruction and no sentence!\n"
+                    "- BAD: question='Fill in the blank with the correct verb.' (NO SENTENCE!)\n"
+                    "- GOOD: question='Er ______ ein Buch. (He reads a book.)' with instruction='Fill in the verb'\n\n"
+                    "**TEXT_QUESTION REQUIREMENTS**:\n"
+                    "- question: Clear question asking for a translation or answer\n"
+                    "- Example: question='Translate to German: The cat is sleeping.'\n"
+                    "- correct_answer: The expected answer in the target language\n\n"
+                    "**IMAGE_QUESTION REQUIREMENTS**:\n"
+                    "- question: Ask what the image shows (e.g., 'What is this in German?')\n"
+                    "- image_prompt: Description for image generation\n"
+                    "- correct_answer: The word/phrase for what's shown\n\n"
+                    "Examples of BAD quiz cards (DO NOT DO):\n"
+                    "- Just showing a word and translation (that's teaching, not testing)\n"
+                    "- Cards without a question field\n"
+                    "- Cards where the user doesn't need to respond\n"
+                    "- fill_in_blank without the actual sentence in the question field!\n\n"
                     "AUDIO CARD REQUIREMENTS:\n"
                     "- audio_transcription: Short 1-3 sentences in the target language for dictation practice\n"
                     f"  - audio_text must be in {language} (target language)\n"
@@ -1733,6 +1967,43 @@ concepts listed above. The user JUST learned these, so the quiz should reinforce
                     "- For beginners (A1-A2): Simple greetings, numbers, basic vocabulary (1 sentence)\n"
                     "- For intermediate (B1-B2): Common phrases, short sentences (1-2 sentences)\n"
                     "- For advanced (C1-C2): Complex sentences, idioms (2-3 sentences)\n\n"
+                    "WORD ORDER REQUIREMENTS (Duolingo-style sentence building):\n"
+                    "- word_order: User arranges scrambled words to form a correct sentence\n"
+                    "  - source_sentence: The sentence to translate (in English)\n"
+                    f"  - correct_word_order: List of words in CORRECT order (in {language})\n"
+                    "  - scrambled_words: Same words but SHUFFLED randomly\n"
+                    "  - distractor_words: 1-2 WRONG words to make it harder (optional, for B1+)\n"
+                    "  - correct_answer: The complete correct sentence as a string\n"
+                    "  - question: 'Arrange the words to translate:' followed by source_sentence\n"
+                    "- Example for German A1:\n"
+                    '  source_sentence: "The dog is big"\n'
+                    '  correct_word_order: ["Der", "Hund", "ist", "groß"]\n'
+                    '  scrambled_words: ["groß", "Hund", "Der", "ist"]\n'
+                    '  correct_answer: "Der Hund ist groß"\n'
+                    "- For beginners (A1-A2): 3-5 words, no distractors\n"
+                    "- For intermediate (B1-B2): 5-8 words, 1-2 distractors\n"
+                    "- For advanced (C1-C2): 8+ words, complex structures, 2-3 distractors\n"
+                    "- IMPORTANT: Include 1-2 word_order cards in each quiz!\n\n"
+                    "READING COMPREHENSION REQUIREMENTS:\n"
+                    "- reading_comprehension: A passage to read with comprehension questions\n"
+                    f"  - reading_passage: A paragraph (3-8 sentences) in {language}\n"
+                    "  - reading_translation: English translation (shown after answering)\n"
+                    "  - reading_questions: List of comprehension questions about the passage\n"
+                    "  - vocabulary_highlights: Key vocabulary from the passage with translations\n"
+                    "  - question: Main question asking about the passage content\n"
+                    "  - correct_answer: The expected answer\n"
+                    "- For beginners: Short, simple passages about daily life, with basic vocabulary\n"
+                    "- For intermediate: More complex topics, varied sentence structures\n"
+                    "- For advanced: Authentic-style texts, idioms, cultural content\n\n"
+                    "WRITING PRACTICE REQUIREMENTS:\n"
+                    "- writing_practice: User writes original text based on a prompt\n"
+                    "  - writing_prompt: A topic/scenario to write about (in English for clarity)\n"
+                    "  - writing_min_words: Minimum word count (default 20)\n"
+                    "  - writing_max_words: Maximum word count (default 100)\n"
+                    "  - instruction: Clear instructions on what to write\n"
+                    "- For beginners: Simple prompts like 'Describe your family' or 'Write 3 sentences about your day'\n"
+                    "- For intermediate: More complex prompts like 'Write about a memorable trip' or 'Explain your opinion on...'\n"
+                    "- For advanced: Essay-style prompts, argument construction, creative writing\n\n"
                     "CRITICAL LANGUAGE RULES:\n"
                     + (
                         # For B1+ learners, questions should be in target language
@@ -1786,6 +2057,10 @@ concepts listed above. The user JUST learned these, so the quiz should reinforce
                             "strengths": assessment_result.strengths,
                             "weaknesses": assessment_result.weaknesses,
                         },
+                        # Explicitly pass words to test from teaching phase
+                        "words_to_test": all_words[:15] if all_words else [],
+                        "verbs_to_test": all_verbs[:10] if all_verbs else [],
+                        "instruction": "Generate 12 quiz cards. PRIORITIZE testing the words and verbs listed above - they were JUST taught in this session's lesson!",
                     },
                     ensure_ascii=False,
                 ),
@@ -2000,6 +2275,108 @@ TEACHING CARD TYPES:
 """
 
 
+def _generate_conjugation_table(
+    verb: str,
+    translation: str,
+    language: str,
+    proficiency: str = "A1",
+    is_new: bool = True,
+    is_review: bool = False,
+) -> Optional[TeachingCard]:
+    """
+    Generate a conjugation table for a verb that's missing one.
+    Makes a quick API call to get proper conjugations.
+    """
+    if not verb or client is None:
+        return None
+    
+    logger.api(f"_generate_conjugation_table() for '{verb}' in {language}")
+    
+    try:
+        # Quick focused prompt for conjugation only
+        prompt = f"""Generate conjugation for the {language} verb "{verb}" ({translation}).
+
+Return ONLY a JSON object with:
+{{
+  "infinitive": "{verb}",
+  "translation": "{translation}",
+  "tense": "Present",
+  "verb_type": "regular" or "irregular",
+  "conjugations": {{
+    // Use the appropriate person labels for {language}
+    // German: "ich", "du", "er/sie/es", "wir", "ihr", "sie/Sie"
+    // Spanish: "yo", "tú", "él/ella/usted", "nosotros", "vosotros", "ellos/ustedes"
+    // French: "je", "tu", "il/elle", "nous", "vous", "ils/elles"
+  }},
+  "conjugation_examples": [
+    {{"sentence": "Example sentence using verb", "translation": "English translation"}}
+  ]
+}}
+
+Fill in the conjugations for {verb} in present tense. Include 2-3 example sentences."""
+
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": f"You are a {language} grammar expert. Return only valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=500,
+            )
+        logger.api_response("conjugation_table", duration_ms=timer.duration_ms)
+        
+        raw = completion.choices[0].message.content
+        data = json.loads(raw)
+        
+        # Build conjugation examples
+        examples = []
+        for ex in data.get("conjugation_examples", []):
+            if isinstance(ex, dict):
+                examples.append({
+                    "sentence": ex.get("sentence", ""),
+                    "translation": ex.get("translation", "")
+                })
+        
+        conjugation_card = TeachingCard(
+            type="conjugation_table",
+            title=f"Conjugation: {verb}",
+            infinitive=data.get("infinitive", verb),
+            translation=data.get("translation", translation),
+            tense=data.get("tense", "Present"),
+            verb_type=data.get("verb_type", "regular"),
+            conjugations=data.get("conjugations", {}),
+            conjugation_examples=examples,
+            explanation=f"Practice conjugating '{verb}' in different forms.",
+            is_new=is_new,
+            is_review=is_review,
+            difficulty_level=proficiency,
+        )
+        
+        logger.success(f"Generated conjugation table for '{verb}': {len(conjugation_card.conjugations)} forms")
+        return conjugation_card
+        
+    except Exception as e:
+        logger.error(f"Failed to generate conjugation table for '{verb}': {e}")
+        # Return a minimal stub so the card isn't completely empty
+        return TeachingCard(
+            type="conjugation_table",
+            title=f"Conjugation: {verb}",
+            infinitive=verb,
+            translation=translation,
+            tense="Present",
+            verb_type="unknown",
+            conjugations={},
+            conjugation_examples=[],
+            explanation=f"Practice conjugating '{verb}' - look up the conjugation forms.",
+            is_new=is_new,
+            is_review=is_review,
+            difficulty_level=proficiency,
+        )
+
+
 def generate_teaching_batch(
     language: str,
     proficiency: str,
@@ -2055,13 +2432,24 @@ For {language}, also consider language-specific elements like:
 - Honorifics (Japanese, Korean)
 - Tones (Chinese, Vietnamese)
 
-MANDATORY FOR ALL VERBS:
-Every verb card (part_of_speech: "verb") MUST be IMMEDIATELY followed by a "conjugation_table" card showing:
-- The infinitive form
-- Present tense conjugations for all persons
-- 2-3 example sentences using different conjugations
+🚨🚨🚨 ABSOLUTE REQUIREMENT FOR VERBS 🚨🚨🚨
+When you include a verb (part_of_speech: "verb"), you MUST output TWO consecutive cards:
 
-NEVER show a verb without its conjugation table immediately after.""",
+CARD 1: vocabulary_intro for the verb
+  - type: "vocabulary_intro"
+  - word: the infinitive (e.g., "gehen")
+  - part_of_speech: "verb"
+  - translation, explanation, example_sentence, etc.
+
+CARD 2: IMMEDIATELY AFTER, a conjugation_table
+  - type: "conjugation_table"  
+  - infinitive: same verb (e.g., "gehen")
+  - conjugations: {{"ich": "gehe", "du": "gehst", "er/sie/es": "geht", "wir": "gehen", "ihr": "geht", "sie/Sie": "gehen"}}
+  - conjugation_examples: [{{"sentence": "Ich gehe nach Hause.", "translation": "I go home."}}]
+
+FAILURE TO INCLUDE CONJUGATION TABLE = REJECTED CARD
+Every single verb MUST have its conjugation table. No exceptions.
+🚨🚨🚨 END VERB REQUIREMENT 🚨🚨🚨""",
             "grammar": f"""Generate {num_cards} grammar lesson cards for {proficiency} level {language}.
 
 Cover DIVERSE grammar topics appropriate for this level:
@@ -2084,18 +2472,33 @@ Pick topics most important for {proficiency} level.""",
 
 Include a DIVERSE mix of word types: nouns, verbs, adjectives, adverbs, etc.
 
-MANDATORY: If reviewing a VERB, ALWAYS include a conjugation_table card immediately after it.""",
+🚨 MANDATORY FOR VERBS IN REVIEW 🚨
+If reviewing a VERB (part_of_speech: "verb"):
+1. First: vocabulary_intro card with the verb
+2. IMMEDIATELY AFTER: conjugation_table card with full conjugations
+
+Example for reviewing "sprechen" (to speak):
+- Card 1: {{"type": "vocabulary_intro", "word": "sprechen", "part_of_speech": "verb", ...}}
+- Card 2: {{"type": "conjugation_table", "infinitive": "sprechen", "conjugations": {{"ich": "spreche", ...}}, ...}}
+
+EVERY verb in review MUST have a conjugation_table immediately following it.""",
         }
         
         avoid_words = ""
         if existing_words:
             # Show all existing words to avoid duplicates across batches AND previous sessions
+            # Limit display to avoid overwhelming the context (but we still filter post-generation)
+            display_words = existing_words[:100]  # Show first 100 for context
             avoid_words = f"""
 
-⚠️ CRITICAL - FORBIDDEN WORDS ({len(existing_words)} words) - DO NOT USE ANY OF THESE:
-{', '.join(existing_words)}
+🚫🚫🚫 ABSOLUTELY FORBIDDEN - DUPLICATE PREVENTION 🚫🚫🚫
+The following {len(existing_words)} words are BANNED. Do NOT use ANY of them:
+{', '.join(display_words)}{'...' if len(existing_words) > 100 else ''}
 
-These words are either already known by the learner or already in this lesson. Generate DIFFERENT words."""
+⚠️ STRICT RULE: If you generate ANY word from this list, it will be REJECTED.
+⚠️ Generate COMPLETELY DIFFERENT vocabulary.
+⚠️ If you're struggling, try different categories: colors, weather, body parts, emotions, food, animals, etc.
+🚫🚫🚫 END FORBIDDEN LIST 🚫🚫🚫"""
         
         conjugation_schema = """
 For VERB cards (part_of_speech: "verb"), ALWAYS follow with a conjugation_table card:
@@ -2170,9 +2573,33 @@ For conjugation_table cards: infinitive, translation, tense, verb_type, conjugat
         data = json.loads(raw)
         cards_data = data.get("cards", data.get("teaching_cards", []))
         
+        # Normalize existing words for comparison (lowercase, strip articles)
+        normalized_existing = set()
+        for w in (existing_words or []):
+            normalized_existing.add(_normalize_word(w, language))
+        
         cards = []
+        seen_in_batch = set()  # Track words seen in THIS batch too
+        
         for card_data in cards_data:
             card = _json_to_teaching_card(card_data)
+            
+            # Check for duplicates (both against existing_words AND within this batch)
+            word_to_check = card.word or card.infinitive or ""
+            normalized_word = _normalize_word(word_to_check, language)
+            
+            if normalized_word and normalized_word in normalized_existing:
+                logger.warning(f"Filtering duplicate word from batch: '{word_to_check}' (normalized: '{normalized_word}')")
+                continue  # Skip this duplicate card
+            
+            if normalized_word and normalized_word in seen_in_batch:
+                logger.warning(f"Filtering duplicate within batch: '{word_to_check}'")
+                continue  # Skip duplicate within same batch
+            
+            # Track this word
+            if normalized_word:
+                seen_in_batch.add(normalized_word)
+            
             # Set batch type flags
             if batch_type == "vocabulary":
                 card.is_new = True
@@ -2182,8 +2609,46 @@ For conjugation_table cards: infinitive, translation, tense, verb_type, conjugat
                 card.is_review = True
             cards.append(card)
         
-        logger.success(f"Batch complete: {len(cards)} {batch_type} cards")
-        return cards
+        # POST-PROCESSING: Ensure verbs have conjugation tables
+        final_cards = []
+        i = 0
+        while i < len(cards):
+            card = cards[i]
+            final_cards.append(card)
+            
+            # Check if this is a verb card that needs a conjugation table
+            is_verb = (
+                card.part_of_speech and card.part_of_speech.lower() == "verb"
+                and card.type != "conjugation_table"
+            )
+            
+            if is_verb:
+                # Check if next card is already a conjugation table for this verb
+                has_following_conjugation = (
+                    i + 1 < len(cards)
+                    and cards[i + 1].type == "conjugation_table"
+                    and cards[i + 1].infinitive 
+                    and _normalize_word(cards[i + 1].infinitive, language) == _normalize_word(card.word or "", language)
+                )
+                
+                if not has_following_conjugation:
+                    # Generate a conjugation table card for this verb via quick API call
+                    logger.warning(f"Verb '{card.word}' missing conjugation table - generating via API")
+                    conjugation_card = _generate_conjugation_table(
+                        verb=card.word or "",
+                        translation=card.translation or "",
+                        language=language,
+                        proficiency=proficiency,
+                        is_new=card.is_new,
+                        is_review=card.is_review,
+                    )
+                    if conjugation_card:
+                        final_cards.append(conjugation_card)
+            
+            i += 1
+        
+        logger.success(f"Batch complete: {len(final_cards)} {batch_type} cards (filtered {len(cards_data) - len(cards)} duplicates, added {len(final_cards) - len(cards)} conjugation tables)")
+        return final_cards
         
     except Exception as e:
         logger.api_error(f"Teaching batch failed: {e}")
@@ -2443,12 +2908,21 @@ def _generate_teaching_content_batched(
         )
         
         # Track words to avoid duplicates (including verb infinitives)
+        # Track both original and normalized forms for robust duplicate detection
         for card in cards:
             if card.word:
                 generated_words.append(card.word)
+                # Also add normalized version for matching
+                normalized = _normalize_word(card.word, language)
+                if normalized and normalized not in generated_words:
+                    generated_words.append(normalized)
             # Also track infinitives from conjugation tables
-            if card.infinitive and card.infinitive not in generated_words:
-                generated_words.append(card.infinitive)
+            if card.infinitive:
+                if card.infinitive not in generated_words:
+                    generated_words.append(card.infinitive)
+                normalized_inf = _normalize_word(card.infinitive, language)
+                if normalized_inf and normalized_inf not in generated_words:
+                    generated_words.append(normalized_inf)
         
         all_cards.extend(cards)
         
@@ -2663,6 +3137,21 @@ def evaluate_card_response(
         logger.debug(f"Speaking evaluation, transcription length: {len(user_response)}")
         return evaluate_speaking_response(card, user_response, language)
     
+    # Reading comprehension: evaluate answers to reading questions
+    if card.type == "reading_comprehension" and user_response:
+        logger.debug(f"Reading comprehension evaluation")
+        return _evaluate_reading_comprehension(card, user_response, language)
+    
+    # Writing practice: detailed writing feedback
+    if card.type == "writing_practice" and user_response:
+        logger.debug(f"Writing practice evaluation, response length: {len(user_response)}")
+        return _evaluate_writing_practice(card, user_response, language)
+    
+    # Word order: compare user's word ordering to correct order
+    if card.type == "word_order" and user_response:
+        logger.debug(f"Word order evaluation")
+        return _evaluate_word_order(card, user_response, language)
+    
     # Fallback for other types
     logger.debug("Using fallback evaluation (no response or unknown type)")
     return {
@@ -2855,6 +3344,78 @@ def _evaluate_text_response_with_api(
         return _evaluate_card_response_fallback(card, user_response, None)
 
 
+def _evaluate_word_order(
+    card: LessonCard,
+    user_response: str,
+    language: str
+) -> Dict[str, Any]:
+    """
+    Evaluate word ordering exercise.
+    user_response is the user's ordered words as a space-separated string.
+    """
+    # Parse user's word order
+    user_words = user_response.strip().split()
+    correct_words = card.correct_word_order or []
+    correct_sentence = card.correct_answer or " ".join(correct_words)
+    
+    # Check if exactly correct
+    is_exact_match = user_words == correct_words
+    
+    # Calculate partial score based on correct positions
+    if not correct_words:
+        return {
+            "is_correct": False,
+            "card_score": 0,
+            "feedback": "No correct answer provided for this card.",
+            "correct_answer": correct_sentence,
+            "alternatives": card.alternatives or [],
+            "vocabulary_expansion": card.vocabulary_expansion or [],
+        }
+    
+    # Count words in correct position
+    correct_positions = 0
+    total_positions = len(correct_words)
+    
+    for i, word in enumerate(user_words):
+        if i < len(correct_words) and word.lower() == correct_words[i].lower():
+            correct_positions += 1
+    
+    # Penalize for wrong number of words
+    length_penalty = abs(len(user_words) - len(correct_words)) * 10
+    
+    # Calculate score
+    position_score = (correct_positions / total_positions * 100) if total_positions > 0 else 0
+    card_score = max(0, int(position_score - length_penalty))
+    
+    # Consider it correct if exact match or very close (90%+ and same length)
+    is_correct = is_exact_match or (card_score >= 90 and len(user_words) == len(correct_words))
+    
+    # Generate feedback
+    if is_correct:
+        feedback = f"Perfect! '{correct_sentence}' is correct."
+    elif card_score >= 70:
+        feedback = f"Almost! The correct order is: '{correct_sentence}'"
+    elif card_score >= 40:
+        # Find specific errors
+        errors = []
+        for i, (user_word, correct_word) in enumerate(zip(user_words, correct_words)):
+            if user_word.lower() != correct_word.lower():
+                errors.append(f"Position {i+1}: '{user_word}' should be '{correct_word}'")
+        error_hint = "; ".join(errors[:2]) if errors else ""
+        feedback = f"Keep trying! {error_hint}. Correct: '{correct_sentence}'"
+    else:
+        feedback = f"The correct sentence is: '{correct_sentence}'. Study the word order!"
+    
+    return {
+        "is_correct": is_correct,
+        "card_score": 100 if is_correct else card_score,
+        "feedback": feedback,
+        "correct_answer": correct_sentence,
+        "alternatives": card.alternatives or [],
+        "vocabulary_expansion": card.vocabulary_expansion or [],
+    }
+
+
 def _evaluate_card_response_fallback(
     card: LessonCard,
     user_response: str,
@@ -2864,6 +3425,10 @@ def _evaluate_card_response_fallback(
     is_correct = False
     if card.type == "multiple_choice" and user_answer_index is not None:
         is_correct = (user_answer_index == card.correct_index)
+    elif card.type == "word_order":
+        # Use word order evaluation even in fallback
+        result = _evaluate_word_order(card, user_response, "")
+        return result
     elif card.correct_answer:
         is_correct = user_response.strip().lower() == card.correct_answer.strip().lower()
     
@@ -2875,6 +3440,222 @@ def _evaluate_card_response_fallback(
         "alternatives": card.alternatives or [],
         "vocabulary_expansion": card.vocabulary_expansion or [],
     }
+
+
+def _evaluate_reading_comprehension(
+    card: LessonCard,
+    user_response: str,
+    language: str
+) -> Dict[str, Any]:
+    """
+    Evaluate reading comprehension answers.
+    The user_response contains answers to reading questions (may be multiple).
+    """
+    if not client:
+        return _evaluate_card_response_fallback(card, user_response, None)
+    
+    try:
+        # Build context from the reading passage and questions
+        passage = card.reading_passage or ""
+        questions = card.reading_questions or []
+        proficiency = card.difficulty_level or "A1"
+        
+        messages = [
+            {
+                "role": "system",
+                "content": f"""You are a {language} language tutor evaluating reading comprehension answers.
+
+LEARNER LEVEL: {proficiency} (evaluate appropriately for this level)
+
+The student read a passage and answered questions about it. Evaluate their understanding.
+
+PASSAGE:
+{passage}
+
+QUESTIONS:
+{json.dumps(questions, indent=2)}
+
+Evaluate the student's answers for:
+1. Comprehension of the passage (considering their {proficiency} level)
+2. Accuracy of answers
+3. Language quality if answers are in {language}
+
+SCORING GUIDELINES for {proficiency}:
+- A1-A2: Focus on basic understanding, accept simple answers
+- B1-B2: Expect more detail and inference
+- C1-C2: Expect nuanced understanding and sophisticated responses
+
+Return ONLY a JSON object:
+{{
+    "is_correct": true if comprehension is good FOR THEIR LEVEL,
+    "card_score": 0-100 based on comprehension (calibrated for {proficiency}),
+    "feedback": "Detailed feedback on comprehension and answers",
+    "correct_answer": "The correct answers summarized",
+    "alternatives": [],
+    "vocabulary_expansion": ["Key vocabulary from passage"],
+    "comprehension_details": {{
+        "main_idea_understood": true/false,
+        "details_understood": true/false,
+        "inference_ability": "good/fair/poor"
+    }}
+}}"""
+            },
+            {
+                "role": "user",
+                "content": f"Student's answers:\n{user_response}"
+            }
+        ]
+        
+        logger.api_call("chat.completions.create (reading_comprehension)", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.3,
+                max_tokens=800,
+            )
+        logger.api_response("reading_comprehension", duration_ms=timer.duration_ms)
+        
+        raw = completion.choices[0].message.content
+        data = json.loads(raw)
+        
+        return {
+            "is_correct": data.get("is_correct", False),
+            "card_score": data.get("card_score", 50),
+            "feedback": data.get("feedback", "Review your answers."),
+            "correct_answer": data.get("correct_answer", ""),
+            "alternatives": data.get("alternatives", []),
+            "vocabulary_expansion": data.get("vocabulary_expansion", []),
+        }
+        
+    except Exception as e:
+        logger.api_error(f"Reading comprehension evaluation failed: {e}")
+        return _evaluate_card_response_fallback(card, user_response, None)
+
+
+def _evaluate_writing_practice(
+    card: LessonCard,
+    user_response: str,
+    language: str
+) -> Dict[str, Any]:
+    """
+    Evaluate writing practice with detailed feedback on grammar, vocabulary, style.
+    Returns comprehensive feedback for language improvement.
+    """
+    if not client:
+        return _evaluate_card_response_fallback(card, user_response, None)
+    
+    try:
+        writing_prompt = card.writing_prompt or card.question or ""
+        min_words = card.writing_min_words
+        max_words = card.writing_max_words
+        proficiency = card.difficulty_level or "A1"
+        
+        # Count words in response
+        word_count = len(user_response.split())
+        
+        messages = [
+            {
+                "role": "system",
+                "content": f"""You are an expert {language} language tutor providing detailed writing feedback.
+
+LEARNER LEVEL: {proficiency}
+WRITING PROMPT: {writing_prompt}
+TARGET LENGTH: {min_words}-{max_words} words
+ACTUAL LENGTH: {word_count} words
+
+LEVEL-APPROPRIATE EXPECTATIONS for {proficiency}:
+- A1: Simple sentences, basic vocabulary, spelling attempts acceptable
+- A2: Short paragraphs, common words, minor grammar errors OK
+- B1: Connected text, varied vocabulary, some complex sentences
+- B2: Clear arguments, good range, mostly correct grammar
+- C1: Sophisticated expression, precise vocabulary, complex structures
+- C2: Near-native quality, subtle nuances, rare errors
+
+Analyze the student's writing comprehensively (calibrated for {proficiency}):
+
+1. GRAMMAR ANALYSIS
+   - Identify specific grammar errors
+   - Note correct grammar usage
+   - Provide corrections with explanations
+
+2. VOCABULARY ASSESSMENT
+   - Evaluate vocabulary range and appropriateness
+   - Suggest more advanced alternatives where applicable
+   - Note any incorrect word usage
+
+3. STRUCTURE & STYLE
+   - Comment on sentence structure variety
+   - Assess coherence and flow
+   - Note any stylistic improvements
+
+4. ERROR PATTERNS
+   - Identify recurring error types for targeted practice
+   - Categorize errors: gender_agreement, verb_conjugation, word_order, spelling, etc.
+
+Return ONLY a JSON object:
+{{
+    "is_correct": true if writing demonstrates {proficiency}-level proficiency,
+    "card_score": 0-100 based on quality FOR A {proficiency} LEARNER,
+    "feedback": "Overall assessment and encouragement",
+    "correct_answer": "A corrected version of their writing",
+    "alternatives": [],
+    "vocabulary_expansion": ["Advanced vocabulary suggestions"],
+    "writing_feedback": {{
+        "grammar_errors": [
+            {{"error": "original text", "correction": "corrected text", "explanation": "why", "error_type": "category"}}
+        ],
+        "vocabulary_suggestions": [
+            {{"original": "basic word", "advanced": "better alternative", "context": "when to use"}}
+        ],
+        "strengths": ["What they did well"],
+        "areas_to_improve": ["What to focus on"],
+        "style_notes": "Comments on writing style",
+        "error_types": ["list of error category strings for tracking"]
+    }}
+}}"""
+            },
+            {
+                "role": "user",
+                "content": f"Student's writing:\n\n{user_response}"
+            }
+        ]
+        
+        logger.api_call("chat.completions.create (writing_practice)", model=DEFAULT_CHAT_MODEL)
+        with Timer() as timer:
+            completion = client.chat.completions.create(
+                model=DEFAULT_CHAT_MODEL,
+                response_format={"type": "json_object"},
+                messages=messages,
+                temperature=0.3,
+                max_tokens=1500,
+            )
+        logger.api_response("writing_practice", duration_ms=timer.duration_ms)
+        
+        raw = completion.choices[0].message.content
+        data = json.loads(raw)
+        
+        # Store detailed feedback in the card for UI display
+        card.writing_feedback = data.get("writing_feedback", {})
+        
+        # Extract error types for tracking
+        error_types = data.get("writing_feedback", {}).get("error_types", [])
+        if error_types:
+            card.error_types = error_types
+        
+        return {
+            "is_correct": data.get("is_correct", False),
+            "card_score": data.get("card_score", 50),
+            "feedback": data.get("feedback", "Keep practicing!"),
+            "correct_answer": data.get("correct_answer", ""),
+            "alternatives": data.get("alternatives", []),
+            "vocabulary_expansion": data.get("vocabulary_expansion", []),
+        }
+        
+    except Exception as e:
+        logger.api_error(f"Writing practice evaluation failed: {e}")
+        return _evaluate_card_response_fallback(card, user_response, None)
 
 
 def evaluate_quiz_performance(
