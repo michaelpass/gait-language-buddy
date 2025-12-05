@@ -1674,6 +1674,36 @@ class LanguageBuddyApp(tk.Tk):
         db.update_language_profile(lang_profile)
         logger.success(f"Language profile updated: {lang_profile.overall_proficiency}")
 
+    def _save_assessment_result_to_database(self, assessment_result: AssessmentResult) -> None:
+        """
+        Save assessment result to database IMMEDIATELY after evaluation.
+        
+        This ensures the learner profile is up-to-date before generating
+        teaching/quiz content, so the LLM context reflects the correct proficiency.
+        """
+        from datetime import datetime, timezone
+        
+        db = get_db()
+        if not db.is_connected():
+            logger.warning("Database not connected, cannot save assessment result")
+            return
+        
+        language = self.selected_language or "Spanish"
+        lang_profile = db.get_language_profile(language)
+        
+        # Update profile with assessment results
+        lang_profile.overall_proficiency = assessment_result.proficiency
+        lang_profile.vocabulary_level = assessment_result.vocabulary_level
+        lang_profile.grammar_level = assessment_result.grammar_level
+        lang_profile.fluency_score = assessment_result.fluency_score
+        lang_profile.strengths = assessment_result.strengths
+        lang_profile.weaknesses = assessment_result.weaknesses
+        lang_profile.recommendations = assessment_result.recommendations
+        lang_profile.last_assessment_date = datetime.now(timezone.utc).isoformat()
+        
+        db.update_language_profile(lang_profile)
+        logger.success(f"Assessment result saved to database: {assessment_result.proficiency} level")
+
     # Card management -------------------------------------------------------
 
     def show_card(self, name: str) -> None:
@@ -2106,6 +2136,16 @@ class LanguageBuddyApp(tk.Tk):
                     self.assessment_result = assessment_result
                     logger.task_complete("evaluate_assessment")
                     logger.ui(f"Assessment evaluated: {assessment_result.proficiency} level")
+                    
+                    # Save assessment result to database IMMEDIATELY so learner context is accurate
+                    self._save_assessment_result_to_database(assessment_result)
+                    
+                    # Regenerate learner context with updated proficiency
+                    if db.is_connected():
+                        self._learner_context = db.generate_llm_context_string(
+                            self.selected_language or "Spanish"
+                        )
+                        logger.debug(f"Regenerated learner context with {assessment_result.proficiency} proficiency")
                     
                     # Show assessment results immediately
                     self.after(0, self._on_assessment_evaluated)
