@@ -2853,6 +2853,7 @@ class AssessmentCardView(ttk.Frame):
         super().__init__(parent)
         self.controller = controller
         self.current_card: Optional[AssessmentCard] = None
+        self.current_stage: int = 0  # Track current stage (1-indexed) separately from card
 
         # Use scrollable frame for content
         self.columnconfigure(0, weight=1)
@@ -3030,6 +3031,7 @@ class AssessmentCardView(ttk.Frame):
     def show_stage(self, stage: int, assessment_card: AssessmentCard) -> None:
         """Display a specific assessment stage."""
         self.current_card = assessment_card
+        self.current_stage = stage  # Track the actual displayed stage number
         card = assessment_card.card
 
         self.stage_label.configure(text=f"Question {stage} of {self.total_stages}")
@@ -3143,7 +3145,7 @@ class AssessmentCardView(ttk.Frame):
 
     def _on_submit_clicked(self) -> None:
         """Handle submit button click."""
-        if not self.current_card:
+        if not self.current_card or self.current_stage < 1:
             return
         
         card = self.current_card.card
@@ -3159,8 +3161,9 @@ class AssessmentCardView(ttk.Frame):
             messagebox.showinfo("Enter an answer", "Please enter your answer before submitting.")
             return
         
+        # Use tracked current_stage, not the card's stage property (which may be incorrect)
         self.controller.submit_assessment_response(
-            self.current_card.stage,
+            self.current_stage,
             response,
             answer_index
         )
